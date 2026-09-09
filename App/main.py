@@ -1,14 +1,16 @@
 import pybullet as p
 import pybullet_data
+import os
 import time
 import math
 import customtkinter as ctk
-from PIL import Image, ImageTk
+from PIL import Image
 import numpy as np
 import threading
 import queue
 import random
 import tkinter as tk
+from render_engine import RobotGPURenderer, quat_to_mat4
 
 # Koyu Tema Ayarları
 ctk.set_appearance_mode("dark")
@@ -52,6 +54,15 @@ class RobotKontrolApp(ctk.CTk):
         self.power_history = [0.0] * 100
         self.current_power = 0.0
         self.e_stop_active = False
+
+        # GPU Renderer paylaşılan durum
+        self.gpu_state_lock = threading.Lock()
+        self.gpu_shared_state = {
+            'running':    True,
+            'transforms': [None] * 7,
+            'obstacle':   None,
+            'preset':     'standard',   # 'standard' | 'hd' | 'fhd'
+        }
 
         self.obstacle_id = None
         self.obstacle_pos = [0.0, 0.0, 0.0]
@@ -123,6 +134,30 @@ class RobotKontrolApp(ctk.CTk):
                                              fg_color="#8B0000", hover_color="#550000", command=self.reset_estop)
         self.btn_estop_reset.pack(pady=(20, 8), padx=20, fill="x")
 
+        # --- RENDER KALİTE SEÇİCİ ---
+        qual_lbl = ctk.CTkLabel(self.sidebar, text="RENDER KALİTESİ",
+                                font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                                text_color="#555555")
+        qual_lbl.pack(pady=(18, 3))
+
+        self.quality_menu = ctk.CTkOptionMenu(
+            self.sidebar,
+            values=["Standard (640p)", "HD (1.5× SS)", "FHD (2× SS)"],
+            command=self.set_render_quality,
+            fg_color="#1A3A5C",
+            button_color="#005A9E",
+            button_hover_color="#003A68",
+            text_color="#FFFFFF",
+            font=ctk.CTkFont(family="Segoe UI", size=12)
+        )
+        self.quality_menu.set("Standard (640p)")
+        self.quality_menu.pack(pady=(0, 6), padx=20, fill="x")
+
+        self.lbl_qual_info = ctk.CTkLabel(self.sidebar, text="640p native · GPU · 60 FPS",
+                                          font=ctk.CTkFont(family="Consolas", size=10),
+                                          text_color="#444444")
+        self.lbl_qual_info.pack(pady=(0, 10))
+
         # --- 2. KONTROL PANELİ ---
         self.pages_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.pages_frame.grid(row=0, column=1, padx=15, pady=(15, 5), sticky="nsew")
@@ -178,9 +213,39 @@ class RobotKontrolApp(ctk.CTk):
         self.init_pybullet()
         self.show_page("manual")
 
+        # GPU Renderer thread başlat
+        mesh_dir = os.path.join(os.path.dirname(__file__),
+                                "..", "fanuc_lrmate200ic_support",
+                                "meshes", "lrmate200ic", "visual")
+        mesh_dir = os.path.normpath(mesh_dir)
+        self.gpu_renderer = RobotGPURenderer(
+            mesh_dir, self.q_img, self.gpu_shared_state, self.gpu_state_lock
+        )
+        self.gpu_renderer.start()
+
         self.worker_thread = threading.Thread(target=self.background_engine, daemon=True)
         self.worker_thread.start()
         self.update_ui_loop()
+
+    # ==========================================
+    # RENDER KALİTE KONTROLÜ
+    # ==========================================
+    def set_render_quality(self, value):
+        preset_map = {
+            "Standard (640p)":  "standard",
+            "HD (1.5× SS)":     "hd",
+            "FHD (2× SS)":      "fhd",
+        }
+        info_map = {
+            "standard": "640p native · GPU · 60 FPS",
+            "hd":       "960p→640p · 1.5× SS · 60 FPS",
+            "fhd":      "1280p→640p · 2× SS · 60 FPS",
+        }
+        preset = preset_map.get(value, "standard")
+        with self.gpu_state_lock:
+            self.gpu_shared_state['preset'] = preset
+        self.lbl_qual_info.configure(text=info_map.get(preset, ""))
+        self.status_message = f"Render kalitesi: {value}"
 
     # ==========================================
     # ENGEL (OBSTACLE) FONKSİYONLARI (RASTGELE BOYUT VE KONUM)
@@ -191,14 +256,17 @@ class RobotKontrolApp(ctk.CTk):
                 hx, hy, hz = 0.08, 0.08, 0.2
                 self.obstacle_pos = [0.4, 0.0, hz]
                 obs_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[hx, hy, hz])
-                obs_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[hx, hy, hz], rgbaColor=[1.0, 0.2, 0.0, 0.8])
                 self.obstacle_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=obs_col,
-                                                     baseVisualShapeIndex=obs_vis, basePosition=self.obstacle_pos)
+                                                     basePosition=self.obstacle_pos)
                 self.status_message = "Engel aktif edildi."
+                with self.gpu_state_lock:
+                    self.gpu_shared_state['obstacle'] = (list(self.obstacle_pos), [hx, hy, hz])
             else:
                 p.removeBody(self.obstacle_id)
                 self.obstacle_id = None
                 self.status_message = "Engel kaldirildi."
+                with self.gpu_state_lock:
+                    self.gpu_shared_state['obstacle'] = None
 
     def randomize_obstacle(self):
         with self.bullet_lock:
@@ -217,9 +285,10 @@ class RobotKontrolApp(ctk.CTk):
 
             self.obstacle_pos = [x, y, z]
             obs_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[hx, hy, hz])
-            obs_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[hx, hy, hz], rgbaColor=[1.0, 0.2, 0.0, 0.8])
             self.obstacle_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=obs_col,
-                                                 baseVisualShapeIndex=obs_vis, basePosition=self.obstacle_pos)
+                                                 basePosition=self.obstacle_pos)
+            with self.gpu_state_lock:
+                self.gpu_shared_state['obstacle'] = ([x, y, z], [hx, hy, hz])
 
             self.status_message = f"Rastgele Engel: Uzunluk {hz * 200:.0f}cm, X:{x * 100:.0f} Y:{y * 100:.0f}"
 
@@ -229,6 +298,8 @@ class RobotKontrolApp(ctk.CTk):
             if self.obstacle_id is not None:
                 p.removeBody(self.obstacle_id)
                 self.obstacle_id = None
+        with self.gpu_state_lock:
+            self.gpu_shared_state['obstacle'] = None
         with self.data_lock:
             for i in range(6):
                 self.slider_vars[i].set(0.0)
@@ -457,19 +528,19 @@ class RobotKontrolApp(ctk.CTk):
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, -9.81)
 
-        grid_color = [0.85, 0.85, 0.85, 1.0]
-        for i in np.arange(-1.5, 1.6, 0.2):
-            v_x = p.createVisualShape(p.GEOM_BOX, halfExtents=[1.5, 0.005, 0.005], rgbaColor=grid_color)
-            p.createMultiBody(baseVisualShapeIndex=v_x, basePosition=[0, i, 0])
-            v_y = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.005, 1.5, 0.005], rgbaColor=grid_color)
-            p.createMultiBody(baseVisualShapeIndex=v_y, basePosition=[i, 0, 0])
-
         urdf_path = "../fanuc_lrmate200ic_support/urdf/fanuc_lrmate200ic.urdf"
         self.robotId = p.loadURDF(urdf_path, [0, 0, 0], p.getQuaternionFromEuler([0, 0, 0]), useFixedBase=True)
 
         self.revolute_joints = [i for i in range(p.getNumJoints(self.robotId)) if
                                 p.getJointInfo(self.robotId, i)[2] == p.JOINT_REVOLUTE]
         self.end_effector_index = self.revolute_joints[-1]
+
+        # GPU renderer için: link adı → PyBullet joint index haritası
+        self.link_joint_map = {}
+        for ji in range(p.getNumJoints(self.robotId)):
+            info = p.getJointInfo(self.robotId, ji)
+            child_link_name = info[12].decode('utf-8')
+            self.link_joint_map[child_link_name] = ji
 
     def save_position(self):
         current_pos = [var.get() for var in self.slider_vars]
@@ -726,11 +797,9 @@ class RobotKontrolApp(ctk.CTk):
                 break
 
         if img is not None:
-            if self.tk_img is None:
-                self.tk_img = ImageTk.PhotoImage(image=img)
-                self.camera_label.configure(image=self.tk_img, text="")
-            else:
-                self.tk_img.paste(img)
+            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(600, 800))
+            self.tk_img = ctk_img
+            self.camera_label.configure(image=self.tk_img, text="")
 
         if self.e_stop_active:
             self.analysis_frame.configure(fg_color="#3A0000", border_color="#FF0000")
@@ -791,11 +860,12 @@ class RobotKontrolApp(ctk.CTk):
         accumulator = 0.0
         time_step = 1.0 / 240.0
 
-        last_time = time.perf_counter()
-        last_render_time = last_time
-        last_tel_time = last_time
-        last_swept_time = last_time
-        init_frames = 0
+        last_time          = time.perf_counter()
+        last_tel_time      = last_time
+        last_swept_time    = last_time
+        last_transform_time = last_time
+
+        current_joints = [0.0] * 6   # keeps last known joint positions for telemetry
 
         while self.is_running:
             current_time = time.perf_counter()
@@ -809,6 +879,7 @@ class RobotKontrolApp(ctk.CTk):
                 targets = list(self.shared_targets)
 
             with self.bullet_lock:
+                # ── Collision / E-STOP check ──────────────────────────────
                 if self.obstacle_id is not None:
                     contacts = p.getContactPoints(self.robotId, self.obstacle_id)
                     if len(contacts) > 0 and not self.e_stop_active:
@@ -821,74 +892,57 @@ class RobotKontrolApp(ctk.CTk):
                     states = p.getJointStates(self.robotId, self.revolute_joints)
                     for i in range(6): targets[i] = states[i][0]
 
+                # ── Motor control ─────────────────────────────────────────
                 for i, joint_idx in enumerate(self.revolute_joints):
                     p.setJointMotorControl2(
                         self.robotId, joint_idx, p.POSITION_CONTROL,
                         targetPosition=targets[i], force=1500, maxVelocity=15.0
                     )
 
+                # ── Physics step at 240 Hz ────────────────────────────────
                 while accumulator >= time_step:
                     p.stepSimulation()
                     accumulator -= time_step
 
+                # ── Power estimation ──────────────────────────────────────
                 total_power = 0.0
                 joint_states = p.getJointStates(self.robotId, self.revolute_joints)
                 for js in joint_states:
-                    velocity = js[1]
-                    torque = js[3]
-                    total_power += abs(velocity * torque)
-
+                    total_power += abs(js[1] * js[3])   # velocity × torque
                 self.current_power = (self.current_power * 0.8) + (total_power * 0.2 * 100)
 
+            # ── Swept volume (workspace trace) ────────────────────────────
             if self.show_workspace and (current_time - last_swept_time >= (1.0 / 15.0)):
                 last_swept_time = current_time
                 with self.bullet_lock:
                     self.draw_swept_volume()
 
-            if current_time - last_render_time >= (1.0 / 20.0):
-                last_render_time = current_time
+            # ── GPU transform update at 60 Hz ─────────────────────────────
+            if current_time - last_transform_time >= (1.0 / 60.0):
+                last_transform_time = current_time
 
+                transforms = [None] * 7
                 with self.bullet_lock:
-                    joint_states = p.getJointStates(self.robotId, self.revolute_joints)
-                current_joints = [js[0] for js in joint_states]
+                    # base_link
+                    base_pos, base_quat = p.getBasePositionAndOrientation(self.robotId)
+                    transforms[0] = quat_to_mat4(base_pos, base_quat)
 
-                is_moving = False
-                for i in range(6):
-                    if abs(current_joints[i] - self.position_history[self.history_idx][i]) > 0.001:
-                        is_moving = True
-                        break
+                    # link_1 … link_6
+                    for idx, link_name in enumerate(
+                            ['link_1', 'link_2', 'link_3', 'link_4', 'link_5', 'link_6']):
+                        if link_name in self.link_joint_map:
+                            ji = self.link_joint_map[link_name]
+                            ls = p.getLinkState(self.robotId, ji)
+                            transforms[idx + 1] = quat_to_mat4(ls[4], ls[5])
 
-                if is_moving or init_frames < 10:
-                    init_frames += 1
+                    # also refresh current_joints for telemetry
+                    js_all = p.getJointStates(self.robotId, self.revolute_joints)
+                    current_joints = [js[0] for js in js_all]
 
-                    # KASMA SORUNU İÇİN ÇÖZÜNÜRLÜK 200x266
-                    render_w, render_h = 200, 266
+                with self.gpu_state_lock:
+                    self.gpu_shared_state['transforms'] = transforms
 
-                    with self.bullet_lock:
-                        view_matrix = p.computeViewMatrixFromYawPitchRoll(cameraTargetPosition=[0, 0, 0.45],
-                                                                          distance=1.65,
-                                                                          yaw=55, pitch=-25, roll=0, upAxisIndex=2)
-                        proj_matrix = p.computeProjectionMatrixFOV(fov=60, aspect=(render_w / render_h), nearVal=0.1,
-                                                                   farVal=100.0)
-
-                        img_arr = p.getCameraImage(render_w, render_h, viewMatrix=view_matrix,
-                                                   projectionMatrix=proj_matrix,
-                                                   renderer=p.ER_TINY_RENDERER, flags=p.ER_NO_SEGMENTATION_MASK)
-
-                    rgba = np.array(img_arr[2], dtype=np.uint8).reshape((render_h, render_w, 4))
-                    depth = np.array(img_arr[3]).reshape((render_h, render_w))
-                    rgba[depth >= 0.99] = [26, 26, 26, 255]
-
-                    pil_img = Image.fromarray(rgba, 'RGBA')
-
-                    try:
-                        pil_img = pil_img.resize((600, 800), Image.Resampling.BILINEAR)
-                    except AttributeError:
-                        pil_img = pil_img.resize((600, 800), Image.BILINEAR)
-
-                    if not self.q_img.full():
-                        self.q_img.put(pil_img)
-
+            # ── Telemetry at 10 Hz ────────────────────────────────────────
             if current_time - last_tel_time >= 0.1:
                 last_tel_time = current_time
 
@@ -896,7 +950,7 @@ class RobotKontrolApp(ctk.CTk):
                     state = p.getLinkState(self.robotId, self.end_effector_index)
                 pos, rpy = state[4], p.getEulerFromQuaternion(state[5])
 
-                log_text = "=== FANUC KONTROLCÜ DURUMU ===\n"
+                log_text  = "=== FANUC KONTROLCÜ DURUMU ===\n"
                 log_text += f"STATUS       : {self.status_message}\n"
                 log_text += f"ACTIVE TOOL  : 1\n"
                 log_text += f"USER FRAME   : 0 (WORLD)\n\n"
@@ -911,10 +965,12 @@ class RobotKontrolApp(ctk.CTk):
                 if not self.q_telemetry.full():
                     self.q_telemetry.put(log_text)
 
-            time.sleep(0.025)
+            time.sleep(0.002)   # physics thread — rendering is done by GPU renderer
 
     def on_closing(self):
         self.is_running = False
+        with self.gpu_state_lock:
+            self.gpu_shared_state['running'] = False
         try:
             self.worker_thread.join(timeout=1.0)
             p.disconnect()
