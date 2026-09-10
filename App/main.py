@@ -10,6 +10,7 @@ import threading
 import queue
 import random
 import tkinter as tk
+from tkinter import filedialog, messagebox
 from render_engine import RobotGPURenderer, quat_to_mat4
 
 # Koyu Tema Ayarları
@@ -156,7 +157,23 @@ class RobotKontrolApp(ctk.CTk):
         self.lbl_qual_info = ctk.CTkLabel(self.sidebar, text="640p native · GPU · 60 FPS",
                                           font=ctk.CTkFont(family="Consolas", size=10),
                                           text_color="#444444")
-        self.lbl_qual_info.pack(pady=(0, 10))
+        self.lbl_qual_info.pack(pady=(0, 6))
+
+        # --- MODEL / URDF SEÇİMİ ---
+        model_lbl = ctk.CTkLabel(self.sidebar, text="ROBOT MODELİ",
+                                 font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                                 text_color="#555555")
+        model_lbl.pack(pady=(10, 3))
+
+        self.btn_load_urdf = ctk.CTkButton(self.sidebar, text="📁 Model Yükle (URDF / Xacro)", height=36, corner_radius=8,
+                                           fg_color="#1E4D2B", hover_color="#163820",
+                                           command=self.open_urdf_file_dialog)
+        self.btn_load_urdf.pack(pady=4, padx=20, fill="x")
+
+        self.btn_reset_model = ctk.CTkButton(self.sidebar, text="↺ Varsayılan Fanuc", height=32, corner_radius=8,
+                                             fg_color="#2A2A2A", hover_color="#3A3A3A",
+                                             command=self.reset_default_robot)
+        self.btn_reset_model.pack(pady=(2, 10), padx=20, fill="x")
 
         # --- 2. KONTROL PANELİ ---
         self.pages_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -301,9 +318,10 @@ class RobotKontrolApp(ctk.CTk):
         with self.gpu_state_lock:
             self.gpu_shared_state['obstacle'] = None
         with self.data_lock:
-            for i in range(6):
+            for i in range(len(self.slider_vars)):
                 self.slider_vars[i].set(0.0)
-                self.shared_targets[i] = 0.0
+                if i < len(self.shared_targets):
+                    self.shared_targets[i] = 0.0
         with self.bullet_lock:
             for i, joint_idx in enumerate(self.revolute_joints):
                 p.resetJointState(self.robotId, joint_idx, 0.0)
@@ -386,22 +404,53 @@ class RobotKontrolApp(ctk.CTk):
                                       command=self.redo_position)
         self.btn_redo.grid(row=0, column=1, padx=(5, 0), sticky="ew")
 
-        slider_card = ctk.CTkFrame(self.page_manual, fg_color="#242424", corner_radius=10)
-        slider_card.pack(fill="both", expand=True)
+        self.slider_card = ctk.CTkScrollableFrame(self.page_manual, fg_color="#242424", corner_radius=10)
+        self.slider_card.pack(fill="both", expand=True)
 
         self.sliders = []
         self.slider_vars = []
-        limits = [(-2.96, 2.96), (-1.04, 2.44), (-2.47, 4.01), (-3.31, 3.31), (-2.09, 2.09), (-6.28, 6.28)]
+        self.rebuild_joint_sliders()
 
-        for i in range(6):
-            label = ctk.CTkLabel(slider_card, text=f"Eksen J{i + 1}", font=ctk.CTkFont(weight="bold"))
-            label.pack(pady=(12, 0))
+    def rebuild_joint_sliders(self):
+        if not hasattr(self, 'slider_card'):
+            return
+
+        for widget in self.slider_card.winfo_children():
+            widget.destroy()
+
+        self.sliders = []
+        self.slider_vars = []
+
+        if not hasattr(self, 'revolute_joints') or not self.revolute_joints:
+            empty_lbl = ctk.CTkLabel(self.slider_card, text="Aktif eklem bulunamadı.", font=ctk.CTkFont(size=12))
+            empty_lbl.pack(pady=20)
+            return
+
+        for i, joint_idx in enumerate(self.revolute_joints):
+            info = p.getJointInfo(self.robotId, joint_idx)
+            raw_name = info[1].decode('utf-8')
+            low = float(info[8])
+            high = float(info[9])
+
+            if low >= high or (abs(low) < 1e-5 and abs(high) < 1e-5):
+                low, high = -math.pi, math.pi
+
+            deg_low = math.degrees(low)
+            deg_high = math.degrees(high)
+
+            lbl_text = f"Eksen J{i+1}: {raw_name} ({deg_low:.0f}° .. {deg_high:.0f}°)"
+            label = ctk.CTkLabel(self.slider_card, text=lbl_text, font=ctk.CTkFont(size=12, weight="bold"))
+            label.pack(pady=(10, 0), padx=20, anchor="w")
+
             var = ctk.DoubleVar(value=0.0)
             self.slider_vars.append(var)
-            slider = ctk.CTkSlider(slider_card, from_=limits[i][0], to=limits[i][1], variable=var,
-                                   button_color="#00FFCC", button_hover_color="#00CCAA", border_width=2,
-                                   border_color="#333")
-            slider.pack(pady=(2, 10), padx=20, fill="x")
+
+            slider = ctk.CTkSlider(
+                self.slider_card, from_=low, to=high, variable=var,
+                button_color="#00FFCC", button_hover_color="#00CCAA", border_width=2,
+                border_color="#333"
+            )
+            slider.pack(pady=(2, 8), padx=20, fill="x")
             slider.bind("<ButtonRelease-1>", lambda event: self.save_position())
             self.sliders.append(slider)
 
@@ -528,19 +577,249 @@ class RobotKontrolApp(ctk.CTk):
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, -9.81)
 
-        urdf_path = "../fanuc_lrmate200ic_support/urdf/fanuc_lrmate200ic.urdf"
-        self.robotId = p.loadURDF(urdf_path, [0, 0, 0], p.getQuaternionFromEuler([0, 0, 0]), useFixedBase=True)
+        self.default_urdf_path = os.path.normpath(os.path.join(
+            os.path.dirname(__file__), "..", "fanuc_lrmate200ic_support", "urdf", "fanuc_lrmate200ic.urdf"
+        ))
+        self.current_urdf_path = self.default_urdf_path
+        self.render_link_names = ['base_link', 'link_1', 'link_2', 'link_3', 'link_4', 'link_5', 'link_6']
 
-        self.revolute_joints = [i for i in range(p.getNumJoints(self.robotId)) if
-                                p.getJointInfo(self.robotId, i)[2] == p.JOINT_REVOLUTE]
-        self.end_effector_index = self.revolute_joints[-1]
+        self.load_robot_model(self.default_urdf_path, initial=True)
 
-        # GPU renderer için: link adı → PyBullet joint index haritası
-        self.link_joint_map = {}
-        for ji in range(p.getNumJoints(self.robotId)):
-            info = p.getJointInfo(self.robotId, ji)
-            child_link_name = info[12].decode('utf-8')
-            self.link_joint_map[child_link_name] = ji
+    def resolve_mesh_path(self, urdf_dir, mesh_filename):
+        if not mesh_filename:
+            return None
+        if isinstance(mesh_filename, bytes):
+            mesh_filename = mesh_filename.decode('utf-8')
+        if os.path.isabs(mesh_filename) and os.path.exists(mesh_filename):
+            return mesh_filename
+
+        clean_path = mesh_filename
+        for prefix in ["package://", "model://", "file://"]:
+            if clean_path.startswith(prefix):
+                clean_path = clean_path[len(prefix):]
+                parts = clean_path.replace("\\", "/").split("/")
+                if len(parts) > 1:
+                    clean_path = os.path.join(*parts[1:])
+                break
+
+        candidate_dirs = [
+            urdf_dir,
+            os.path.normpath(os.path.join(urdf_dir, "..")),
+            os.path.normpath(os.path.join(urdf_dir, "meshes")),
+            os.path.normpath(os.path.join(urdf_dir, "..", "meshes")),
+            os.path.normpath(os.path.join(urdf_dir, "..", "..")),
+        ]
+
+        for cdir in candidate_dirs:
+            p_check = os.path.normpath(os.path.join(cdir, clean_path))
+            if os.path.exists(p_check):
+                return p_check
+
+        base_name = os.path.basename(mesh_filename)
+        for cdir in candidate_dirs:
+            p_check = os.path.normpath(os.path.join(cdir, base_name))
+            if os.path.exists(p_check):
+                return p_check
+            for sub in ["meshes", "visual", "collision"]:
+                p_sub = os.path.normpath(os.path.join(cdir, sub, base_name))
+                if os.path.exists(p_sub):
+                    return p_sub
+
+        try:
+            for root, dirs, files in os.walk(os.path.dirname(urdf_dir)):
+                if base_name in files:
+                    return os.path.join(root, base_name)
+        except Exception:
+            pass
+
+        return None
+
+    def extract_robot_mesh_data(self, urdf_path):
+        urdf_dir = os.path.dirname(os.path.abspath(urdf_path))
+        try:
+            shapes = p.getVisualShapeData(self.robotId)
+        except Exception:
+            shapes = []
+
+        link_shapes = {}
+        for s in shapes:
+            link_idx = s[1]
+            mesh_file = s[4]
+            rgba = s[7]
+            resolved_p = None
+            if mesh_file:
+                resolved_p = self.resolve_mesh_path(urdf_dir, mesh_file)
+            col = (float(rgba[0]), float(rgba[1]), float(rgba[2])) if (rgba and any(rgba[:3])) else None
+            link_shapes[link_idx] = (resolved_p, col)
+
+        mesh_data = []
+        default_palette = [
+            (0.25, 0.25, 0.25),
+            (0.96, 0.76, 0.13),
+            (0.96, 0.76, 0.13),
+            (0.96, 0.76, 0.13),
+            (0.96, 0.76, 0.13),
+            (0.20, 0.20, 0.20),
+            (0.25, 0.25, 0.25),
+            (0.00, 0.65, 0.85),
+            (0.95, 0.35, 0.10)
+        ]
+
+        link_map = getattr(self, 'link_joint_map', {})
+        for i, link_name in enumerate(self.render_link_names):
+            link_idx = -1 if i == 0 else link_map.get(link_name, i - 1)
+            resolved_path = None
+            color = default_palette[i % len(default_palette)]
+            if link_idx in link_shapes:
+                rp, c = link_shapes[link_idx]
+                if rp and os.path.exists(rp):
+                    resolved_path = rp
+                if c:
+                    color = c
+            mesh_data.append((link_name, resolved_path, color))
+
+        return mesh_data
+
+    def load_robot_model(self, urdf_path, initial=False):
+        if not os.path.isfile(urdf_path):
+            if not initial:
+                messagebox.showerror("Hata", f"Seçilen dosya bulunamadı:\n{urdf_path}")
+            return False
+
+        try:
+            self.status_message = "Robot modeli yükleniyor..."
+            urdf_dir = os.path.dirname(os.path.abspath(urdf_path))
+
+            with self.bullet_lock:
+                if hasattr(self, 'robotId') and self.robotId is not None:
+                    try:
+                        p.removeBody(self.robotId)
+                    except Exception:
+                        pass
+
+                p.setAdditionalSearchPath(urdf_dir)
+                p.setAdditionalSearchPath(os.path.normpath(os.path.join(urdf_dir, "..")))
+
+                self.robotId = p.loadURDF(
+                    urdf_path,
+                    [0, 0, 0],
+                    p.getQuaternionFromEuler([0, 0, 0]),
+                    useFixedBase=True
+                )
+                self.current_urdf_path = urdf_path
+
+                num_joints = p.getNumJoints(self.robotId)
+                self.revolute_joints = [
+                    i for i in range(num_joints)
+                    if p.getJointInfo(self.robotId, i)[2] in (p.JOINT_REVOLUTE, p.JOINT_PRISMATIC, getattr(p, 'JOINT_CONTINUOUS', 0))
+                ]
+                if not self.revolute_joints:
+                    self.revolute_joints = [i for i in range(num_joints) if p.getJointInfo(self.robotId, i)[2] != p.JOINT_FIXED]
+                if not self.revolute_joints:
+                    self.revolute_joints = list(range(min(6, num_joints)))
+
+                self.end_effector_index = self.revolute_joints[-1] if self.revolute_joints else 0
+
+                self.link_joint_map = {}
+                self.render_link_names = ['base_link']
+                for ji in range(num_joints):
+                    info = p.getJointInfo(self.robotId, ji)
+                    child_link_name = info[12].decode('utf-8')
+                    self.link_joint_map[child_link_name] = ji
+                    if ji in self.revolute_joints:
+                        self.render_link_names.append(child_link_name)
+
+                mesh_data = self.extract_robot_mesh_data(urdf_path)
+
+            n_joints = len(self.revolute_joints)
+            with self.data_lock:
+                self.shared_targets = [0.0] * n_joints
+                self.position_history = [[0.0] * n_joints]
+                self.history_idx = 0
+
+            if not initial and hasattr(self, 'gpu_renderer'):
+                with self.gpu_state_lock:
+                    self.gpu_shared_state['mesh_data'] = mesh_data
+                    self.gpu_shared_state['reload_meshes'] = True
+                    self.gpu_shared_state['transforms'] = [None] * len(self.render_link_names)
+
+            if hasattr(self, 'slider_card'):
+                self.rebuild_joint_sliders()
+
+            robot_name = os.path.splitext(os.path.basename(urdf_path))[0]
+            if robot_name.startswith(".") and robot_name.endswith("_generated"):
+                robot_name = robot_name[1:-10]
+            self.title(f"NexusControl Studio | Model: {robot_name} ({n_joints} Eksen)")
+            self.status_message = f"Model Başarıyla Yüklendi: {robot_name} ({n_joints} Eksen)"
+            return True
+
+        except Exception as e:
+            if not initial:
+                messagebox.showerror("URDF Yükleme Hatası", f"Model yüklenirken bir hata oluştu:\n{str(e)}")
+            self.status_message = f"HATA: Model yüklenemedi ({str(e)})"
+            return False
+
+    def convert_xacro_to_urdf(self, xacro_path):
+        try:
+            import xacro
+        except ImportError:
+            messagebox.showerror(
+                "Eksik Modül",
+                "Xacro dosyalarını dönüştürmek için 'xacro' kütüphanesi gereklidir.\n"
+                "Terminalden 'pip install xacro' komutunu çalıştırabilirsiniz."
+            )
+            self.status_message = "HATA: 'xacro' modülü yüklü değil!"
+            return None
+
+        try:
+            self.status_message = "Xacro modeli derleniyor..."
+            doc = xacro.process_file(xacro_path)
+            urdf_content = doc.toxml()
+
+            base_dir = os.path.dirname(os.path.abspath(xacro_path))
+            file_name = os.path.splitext(os.path.basename(xacro_path))[0]
+            out_path = os.path.join(base_dir, f".{file_name}_generated.urdf")
+
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(urdf_content)
+            except Exception:
+                import tempfile
+                out_path = os.path.join(tempfile.gettempdir(), f"{file_name}_generated.urdf")
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(urdf_content)
+
+            return out_path
+        except Exception as e:
+            messagebox.showerror("Xacro Derleme Hatası", f"Xacro dosyası URDF'e dönüştürülürken hata oluştu:\n{str(e)}")
+            self.status_message = f"HATA: Xacro derlenemedi ({str(e)})"
+            return None
+
+    def open_urdf_file_dialog(self):
+        file_path = filedialog.askopenfilename(
+            title="Robot Modeli Seçin (URDF / Xacro)",
+            filetypes=[
+                ("Desteklenen Modeller (*.urdf, *.xacro)", "*.urdf;*.xacro"),
+                ("URDF Modelleri (*.urdf)", "*.urdf"),
+                ("Xacro Modelleri (*.xacro)", "*.xacro"),
+                ("Tüm Dosyalar (*.*)", "*.*")
+            ]
+        )
+        if not file_path:
+            return
+
+        if file_path.lower().endswith(".xacro"):
+            converted_urdf = self.convert_xacro_to_urdf(file_path)
+            if converted_urdf:
+                self.load_robot_model(converted_urdf)
+        else:
+            self.load_robot_model(file_path)
+
+    def reset_default_robot(self):
+        if hasattr(self, 'default_urdf_path') and os.path.exists(self.default_urdf_path):
+            self.load_robot_model(self.default_urdf_path)
+        else:
+            messagebox.showwarning("Uyarı", "Varsayılan Fanuc URDF dosyası bulunamadı.")
 
     def save_position(self):
         current_pos = [var.get() for var in self.slider_vars]
@@ -556,12 +835,18 @@ class RobotKontrolApp(ctk.CTk):
     def undo_position(self):
         if self.history_idx > 0:
             self.history_idx -= 1
-            for i, var in enumerate(self.slider_vars): var.set(self.position_history[self.history_idx][i])
+            hist = self.position_history[self.history_idx]
+            for i, var in enumerate(self.slider_vars):
+                if i < len(hist):
+                    var.set(hist[i])
 
     def redo_position(self):
         if self.history_idx < len(self.position_history) - 1:
             self.history_idx += 1
-            for i, var in enumerate(self.slider_vars): var.set(self.position_history[self.history_idx][i])
+            hist = self.position_history[self.history_idx]
+            for i, var in enumerate(self.slider_vars):
+                if i < len(hist):
+                    var.set(hist[i])
 
     def calculate_fk(self):
         with self.bullet_lock:
@@ -580,17 +865,14 @@ class RobotKontrolApp(ctk.CTk):
             [0.0, 0.0, 0.0, 1.0]
         ]
 
+        n_joints = len(self.revolute_joints)
         fk_log = "\n\n" + "=" * 52 + "\n"
         fk_log += "=== İLERİ KİNEMATİK (FK) MATEMATİKSEL ANALİZİ ===\n"
-        fk_log += ">> 1. DENAVIT-HARTENBERG (D-H) TABLOSU\n"
-        fk_log += "  i |  θ_i (Açı)  |  d_i (cm) |  a_i (cm) |  α_i \n"
+        fk_log += f">> 1. EKLEM DURUMLARI (Aktif Eksen: {n_joints})\n"
+        fk_log += "  i |  θ_i (Açı)  |  θ_i (Radyan) \n"
         fk_log += "-" * 52 + "\n"
-        fk_log += f"  1 | {math.degrees(current_joints[0]):8.2f}° |    33.0   |    5.0   |  -90°\n"
-        fk_log += f"  2 | {math.degrees(current_joints[1]):8.2f}° |     0.0   |   33.0   |    0°\n"
-        fk_log += f"  3 | {math.degrees(current_joints[2]):8.2f}° |     0.0   |    3.5   |  -90°\n"
-        fk_log += f"  4 | {math.degrees(current_joints[3]):8.2f}° |    33.5   |    0.0   |   90°\n"
-        fk_log += f"  5 | {math.degrees(current_joints[4]):8.2f}° |     0.0   |    0.0   |  -90°\n"
-        fk_log += f"  6 | {math.degrees(current_joints[5]):8.2f}° |     8.0   |    0.0   |    0°\n"
+        for i, val in enumerate(current_joints):
+            fk_log += f"  {i+1} | {math.degrees(val):8.2f}° | {val:8.4f} rad\n"
 
         fk_log += "\n>> 2. DÖNÜŞÜM MATRİSİ (A_i) FORMÜLÜ\n"
         fk_log += "  [ cos(θ)  -sin(θ)*cos(α)   sin(θ)*sin(α)  a*cos(θ) ]\n"
@@ -598,8 +880,8 @@ class RobotKontrolApp(ctk.CTk):
         fk_log += "  [   0          sin(α)           cos(α)       d     ]\n"
         fk_log += "  [   0            0                0          1     ]\n"
 
-        fk_log += "\n>> 3. NİHAİ HOMOJEN DÖNÜŞÜM MATRİSİ (T_0^6)\n"
-        fk_log += "  T = A_1 * A_2 * A_3 * A_4 * A_5 * A_6\n"
+        fk_log += f"\n>> 3. NİHAİ HOMOJEN DÖNÜŞÜM MATRİSİ (T_0^{n_joints})\n"
+        fk_log += f"  T = A_1 * ... * A_{n_joints}\n"
         fk_log += "        [ R11    R12    R13  |    Px    ]\n"
         fk_log += f"        [{T[0][0]:6.3f} {T[0][1]:6.3f} {T[0][2]:6.3f}  | {T[0][3]:8.2f} cm]\n"
         fk_log += f"        [{T[1][0]:6.3f} {T[1][1]:6.3f} {T[1][2]:6.3f}  | {T[1][3]:8.2f} cm]\n"
@@ -627,6 +909,7 @@ class RobotKontrolApp(ctk.CTk):
             math_log = "\n\n" + "=" * 50 + "\n"
             math_log += "=== TERS KİNEMATİK (IK) MATEMATİKSEL ÇÖZÜMÜ ===\n"
 
+            n_joints = len(self.revolute_joints)
             with self.bullet_lock:
                 if self.obstacle_id is not None:
                     state = p.getLinkState(self.robotId, self.end_effector_index)
@@ -638,12 +921,12 @@ class RobotKontrolApp(ctk.CTk):
                     # Ara Nokta 1 (Sadece yukarı kalk)
                     wp1 = p.calculateInverseKinematics(self.robotId, self.end_effector_index, [cx, cy, safe_z],
                                                        maxNumIterations=500)
-                    self.pending_waypoints.append(list(wp1[:6]))
+                    self.pending_waypoints.append(list(wp1[:n_joints]))
 
                     # Ara Nokta 2 (Hedefin üzerine süzül)
                     wp2 = p.calculateInverseKinematics(self.robotId, self.end_effector_index, [x_m, y_m, safe_z],
                                                        maxNumIterations=500)
-                    self.pending_waypoints.append(list(wp2[:6]))
+                    self.pending_waypoints.append(list(wp2[:n_joints]))
 
                     math_log += f">> OTONOM KAÇIŞ AKTİF: Engel Algılandı.\n"
                     math_log += f">> {safe_z * 100:.0f}cm irtifadan U-Dönüş rotası çizildi.\n\n"
@@ -651,11 +934,11 @@ class RobotKontrolApp(ctk.CTk):
                 # Nihai Hedefe İniş
                 final_angles = p.calculateInverseKinematics(self.robotId, self.end_effector_index, [x_m, y_m, z_m],
                                                             maxNumIterations=500)
-                self.pending_waypoints.append(list(final_angles[:6]))
+                self.pending_waypoints.append(list(final_angles[:n_joints]))
 
             current_angles = [var.get() for var in self.slider_vars]
 
-            deg_diffs = [abs(math.degrees(self.pending_waypoints[-1][i] - current_angles[i])) for i in range(6)]
+            deg_diffs = [abs(math.degrees(self.pending_waypoints[-1][i] - current_angles[i])) for i in range(min(n_joints, len(current_angles)))]
             max_deg = max(deg_diffs) if deg_diffs else 0
 
             self.time_fast = max(0.5, max_deg / 100.0)
@@ -713,8 +996,9 @@ class RobotKontrolApp(ctk.CTk):
         strat_name = "Hızlı" if strategy == "fast" else "Ekonomik"
         self.status_message = f"{strat_name} Rota başlatıldı. Süzülüyor..."
 
+        n_joints = len(self.revolute_joints)
         with self.data_lock:
-            current_angles = [self.shared_targets[i] for i in range(6)]
+            current_angles = [self.shared_targets[i] for i in range(min(n_joints, len(self.shared_targets)))]
 
         threading.Thread(target=self.run_trajectory_thread,
                          args=(strategy, self.pending_waypoints, current_angles, duration), daemon=True).start()
@@ -745,12 +1029,13 @@ class RobotKontrolApp(ctk.CTk):
 
                 with self.bullet_lock:
                     for i, joint_idx in enumerate(self.revolute_joints):
-                        p.resetJointState(self.robotId, joint_idx, angles[i])
+                        if i < len(angles):
+                            p.resetJointState(self.robotId, joint_idx, angles[i])
                     if self.show_workspace:
                         self.draw_swept_volume()
 
                 with self.data_lock:
-                    for i in range(6):
+                    for i in range(min(len(angles), len(self.shared_targets))):
                         self.shared_targets[i] = angles[i]
 
                 time.sleep(duration_per_wp / steps)
@@ -765,13 +1050,14 @@ class RobotKontrolApp(ctk.CTk):
 
     def go_to_ik_step(self, angles):
         with self.data_lock:
-            for i in range(6):
+            for i in range(min(len(angles), len(self.slider_vars), len(self.shared_targets))):
                 self.slider_vars[i].set(angles[i])
                 self.shared_targets[i] = angles[i]
 
         with self.bullet_lock:
             for i, joint_idx in enumerate(self.revolute_joints):
-                p.resetJointState(self.robotId, joint_idx, angles[i])
+                if i < len(angles):
+                    p.resetJointState(self.robotId, joint_idx, angles[i])
             if self.show_workspace:
                 self.draw_swept_volume()
 
@@ -782,11 +1068,12 @@ class RobotKontrolApp(ctk.CTk):
         if not self.is_running: return
 
         with self.data_lock:
+            n_vars = len(self.slider_vars)
             if getattr(self, "is_trajectory_playing", False):
-                for i in range(6):
+                for i in range(min(n_vars, len(self.shared_targets))):
                     self.slider_vars[i].set(self.shared_targets[i])
             else:
-                for i in range(6):
+                for i in range(min(n_vars, len(self.shared_targets))):
                     self.shared_targets[i] = self.slider_vars[i].get()
 
         img = None
@@ -865,7 +1152,7 @@ class RobotKontrolApp(ctk.CTk):
         last_swept_time    = last_time
         last_transform_time = last_time
 
-        current_joints = [0.0] * 6   # keeps last known joint positions for telemetry
+        current_joints = [0.0] * len(self.revolute_joints)   # keeps last known joint positions for telemetry
 
         while self.is_running:
             current_time = time.perf_counter()
@@ -885,19 +1172,21 @@ class RobotKontrolApp(ctk.CTk):
                     if len(contacts) > 0 and not self.e_stop_active:
                         self.e_stop_active = True
                         states = p.getJointStates(self.robotId, self.revolute_joints)
-                        for i in range(6):
+                        for i in range(min(len(states), len(self.shared_targets))):
                             self.shared_targets[i] = states[i][0]
 
                 if self.e_stop_active:
                     states = p.getJointStates(self.robotId, self.revolute_joints)
-                    for i in range(6): targets[i] = states[i][0]
+                    for i in range(min(len(states), len(targets))):
+                        targets[i] = states[i][0]
 
                 # ── Motor control ─────────────────────────────────────────
                 for i, joint_idx in enumerate(self.revolute_joints):
-                    p.setJointMotorControl2(
-                        self.robotId, joint_idx, p.POSITION_CONTROL,
-                        targetPosition=targets[i], force=1500, maxVelocity=15.0
-                    )
+                    if i < len(targets):
+                        p.setJointMotorControl2(
+                            self.robotId, joint_idx, p.POSITION_CONTROL,
+                            targetPosition=targets[i], force=1500, maxVelocity=15.0
+                        )
 
                 # ── Physics step at 240 Hz ────────────────────────────────
                 while accumulator >= time_step:
@@ -921,19 +1210,20 @@ class RobotKontrolApp(ctk.CTk):
             if current_time - last_transform_time >= (1.0 / 60.0):
                 last_transform_time = current_time
 
-                transforms = [None] * 7
+                transforms = [None] * len(self.render_link_names)
                 with self.bullet_lock:
-                    # base_link
+                    # base_link (index 0)
                     base_pos, base_quat = p.getBasePositionAndOrientation(self.robotId)
                     transforms[0] = quat_to_mat4(base_pos, base_quat)
 
-                    # link_1 … link_6
-                    for idx, link_name in enumerate(
-                            ['link_1', 'link_2', 'link_3', 'link_4', 'link_5', 'link_6']):
+                    # Dynamic child links
+                    for idx, link_name in enumerate(self.render_link_names[1:]):
                         if link_name in self.link_joint_map:
                             ji = self.link_joint_map[link_name]
                             ls = p.getLinkState(self.robotId, ji)
                             transforms[idx + 1] = quat_to_mat4(ls[4], ls[5])
+                        else:
+                            transforms[idx + 1] = transforms[0]
 
                     # also refresh current_joints for telemetry
                     js_all = p.getJointStates(self.robotId, self.revolute_joints)
@@ -950,7 +1240,8 @@ class RobotKontrolApp(ctk.CTk):
                     state = p.getLinkState(self.robotId, self.end_effector_index)
                 pos, rpy = state[4], p.getEulerFromQuaternion(state[5])
 
-                log_text  = "=== FANUC KONTROLCÜ DURUMU ===\n"
+                model_name = os.path.splitext(os.path.basename(getattr(self, 'current_urdf_path', 'Fanuc LR-Mate')))[0]
+                log_text  = f"=== KONTROLCÜ DURUMU ({model_name}) ===\n"
                 log_text += f"STATUS       : {self.status_message}\n"
                 log_text += f"ACTIVE TOOL  : 1\n"
                 log_text += f"USER FRAME   : 0 (WORLD)\n\n"
@@ -958,9 +1249,9 @@ class RobotKontrolApp(ctk.CTk):
                 log_text += f"X : {pos[0] * 100:7.2f} cm    W (Roll) : {math.degrees(rpy[0]):7.2f}°\n"
                 log_text += f"Y : {pos[1] * 100:7.2f} cm    P (Pitch): {math.degrees(rpy[1]):7.2f}°\n"
                 log_text += f"Z : {pos[2] * 100:7.2f} cm    R (Yaw)  : {math.degrees(rpy[2]):7.2f}°\n\n"
-                log_text += "--- EKLEM AÇILARI (Joints) ---\n"
-                for i in range(6):
-                    log_text += f"J{i + 1} : {math.degrees(current_joints[i]):7.2f}°\n"
+                log_text += f"--- EKLEM AÇILARI (Joints - {len(current_joints)} Eksen) ---\n"
+                for i, c_angle in enumerate(current_joints):
+                    log_text += f"J{i + 1} : {math.degrees(c_angle):7.2f}°\n"
 
                 if not self.q_telemetry.full():
                     self.q_telemetry.put(log_text)

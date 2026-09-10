@@ -1,4 +1,4 @@
-﻿import os, math, time, threading
+import os, math, time, threading
 import numpy as np
 from PIL import Image
 import moderngl, glfw, trimesh
@@ -177,47 +177,103 @@ class RobotGPURenderer:
         grid_prog=ctx.program(vertex_shader=_GRID_VERT,fragment_shader=_GRID_FRAG)
         axis_prog=ctx.program(vertex_shader=_AXIS_VERT,fragment_shader=_AXIS_FRAG)
 
-        robot_vaos={}
+        robot_vaos = {}
+        current_link_names = list(LINK_NAMES)
         for name in LINK_NAMES:
-            p=os.path.join(self.mesh_dir,f'{name}.stl')
-            try: robot_vaos[name]=self._load_vao(ctx,prog,p)
-            except Exception as e: print(f'[GPURender] {name}: {e}')
+            p = os.path.join(self.mesh_dir, f'{name}.stl')
+            try:
+                robot_vaos[name] = (self._load_vao(ctx, prog, p), LINK_COLORS.get(name, (0.8, 0.8, 0.8)))
+            except Exception as e:
+                print(f'[GPURender] {name}: {e}')
 
-        grid_vao=ctx.vertex_array(grid_prog,[(ctx.buffer(_grid_verts().tobytes()),'3f','in_pos')])
-        axis_vao=ctx.vertex_array(axis_prog,[(ctx.buffer(_axis_verts().tobytes()),'3f 3f','in_pos','in_col')])
+        grid_vao = ctx.vertex_array(grid_prog, [(ctx.buffer(_grid_verts().tobytes()), '3f', 'in_pos')])
+        axis_vao = ctx.vertex_array(axis_prog, [(ctx.buffer(_axis_verts().tobytes()), '3f 3f', 'in_pos', 'in_col')])
 
-        box_vao=None; box_vbo=None; box_key=None
-        cur_rw,cur_rh=640,800
-        fbo=self._make_fbo(ctx,cur_rw,cur_rh)
-        cam_yaw,cam_pitch,cam_dist=45.0,-30.0,1.8
-        cam_target=np.array([0.,0.,0.45])
-        last_t=time.perf_counter()
+        box_vao = None; box_vbo = None; box_key = None
+        cur_rw, cur_rh = 640, 800
+        fbo = self._make_fbo(ctx, cur_rw, cur_rh)
+        cam_yaw, cam_pitch, cam_dist = 45.0, -30.0, 1.8
+        cam_target = np.array([0., 0., 0.45])
+        last_t = time.perf_counter()
 
         while True:
+            new_mesh_data = None
             with self.lock:
-                if not self.shared.get('running',True): break
-                transforms=self.shared.get('transforms',[None]*7)
-                obstacle=self.shared.get('obstacle',None)
-                preset=self.shared.get('preset','standard')
-            cfg=PRESETS.get(preset,PRESETS['standard'])
-            rw,rh=cfg['render']; dw,dh=cfg['display']
-            if rw!=cur_rw or rh!=cur_rh:
-                fbo.release(); cur_rw,cur_rh=rw,rh; fbo=self._make_fbo(ctx,cur_rw,cur_rh)
-            eye=_eye_pos(cam_target,cam_yaw,cam_pitch,cam_dist)
-            view=_look_at(eye,cam_target)
-            proj=_perspective(60.0,cur_rw/cur_rh,0.01,100.0)
-            view_b=view.T.astype(np.float32).tobytes()
-            proj_b=proj.T.astype(np.float32).tobytes()
-            fbo.use(); ctx.viewport=(0,0,cur_rw,cur_rh); ctx.clear(0.098,0.098,0.098,1.0)
+                if not self.shared.get('running', True): break
+                transforms = self.shared.get('transforms', [None] * len(current_link_names))
+                obstacle = self.shared.get('obstacle', None)
+                preset = self.shared.get('preset', 'standard')
+                if self.shared.get('reload_meshes', False):
+                    new_mesh_data = self.shared.get('mesh_data', [])
+                    self.shared['reload_meshes'] = False
+
+            # Dinamik model yükleme talebi geldiğinde VAO'ları güncelle
+            if new_mesh_data is not None:
+                for vao_item in robot_vaos.values():
+                    try:
+                        if isinstance(vao_item, tuple): vao_item[0].release()
+                        elif hasattr(vao_item, 'release'): vao_item.release()
+                    except Exception:
+                        pass
+                robot_vaos.clear()
+                current_link_names = []
+
+                for item in new_mesh_data:
+                    name = item[0]
+                    mesh_src = item[1]
+                    col = item[2] if len(item) > 2 and item[2] else (0.85, 0.85, 0.85)
+                    current_link_names.append(name)
+
+                    vao = None
+                    if mesh_src and isinstance(mesh_src, str) and os.path.isfile(mesh_src):
+                        try:
+                            vao = self._load_vao(ctx, prog, mesh_src)
+                        except Exception as e:
+                            print(f'[GPURender] Mesh okunamadı ({name}): {e}')
+
+                    # Eğer mesh dosyası yoksa veya yüklenemediyse fallback görsel geometri oluştur
+                    if vao is None:
+                        try:
+                            cyl = trimesh.creation.cylinder(radius=0.035, height=0.09)
+                            v = np.asarray(cyl.vertices, dtype=np.float32)
+                            n = np.asarray(cyl.vertex_normals, dtype=np.float32)
+                            f = np.asarray(cyl.faces, dtype=np.uint32)
+                            data = np.hstack([v, n]).astype(np.float32)
+                            vbo = ctx.buffer(data.tobytes())
+                            ibo = ctx.buffer(f.tobytes())
+                            vao = ctx.vertex_array(prog, [(vbo, '3f 3f', 'in_position', 'in_normal')], ibo)
+                        except Exception:
+                            pass
+
+                    if vao is not None:
+                        robot_vaos[name] = (vao, col)
+
+            cfg = PRESETS.get(preset, PRESETS['standard'])
+            rw, rh = cfg['render']; dw, dh = cfg['display']
+            if rw != cur_rw or rh != cur_rh:
+                fbo.release(); cur_rw, cur_rh = rw, rh; fbo = self._make_fbo(ctx, cur_rw, cur_rh)
+            eye = _eye_pos(cam_target, cam_yaw, cam_pitch, cam_dist)
+            view = _look_at(eye, cam_target)
+            proj = _perspective(60.0, cur_rw / cur_rh, 0.01, 100.0)
+            view_b = view.T.astype(np.float32).tobytes()
+            proj_b = proj.T.astype(np.float32).tobytes()
+            fbo.use(); ctx.viewport = (0, 0, cur_rw, cur_rh); ctx.clear(0.098, 0.098, 0.098, 1.0)
             prog['u_view'].write(view_b); prog['u_proj'].write(proj_b)
-            prog['u_light_pos'].value=(2.5,2.0,4.5)
-            prog['u_view_pos'].value=tuple(float(e) for e in eye)
-            prog['u_ambient'].value=0.28
-            for i,name in enumerate(LINK_NAMES):
-                T=(transforms[i] if (transforms and transforms[i] is not None) else np.eye(4,dtype=np.float32))
+            prog['u_light_pos'].value = (2.5, 2.0, 4.5)
+            prog['u_view_pos'].value = tuple(float(e) for e in eye)
+            prog['u_ambient'].value = 0.28
+            for i, name in enumerate(current_link_names):
+                T = (transforms[i] if (transforms and i < len(transforms) and transforms[i] is not None) else np.eye(4, dtype=np.float32))
                 prog['u_model'].write(T.T.astype(np.float32).tobytes())
-                prog['u_color'].value=LINK_COLORS[name]
-                if name in robot_vaos: robot_vaos[name].render()
+                if name in robot_vaos:
+                    vao_entry = robot_vaos[name]
+                    if isinstance(vao_entry, tuple):
+                        vao, col = vao_entry
+                        prog['u_color'].value = col
+                        vao.render()
+                    else:
+                        prog['u_color'].value = LINK_COLORS.get(name, (0.8, 0.8, 0.8))
+                        vao_entry.render()
             if obstacle is not None:
                 obs_pos,half=obstacle
                 key=(round(half[0],4),round(half[1],4),round(half[2],4))
