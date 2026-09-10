@@ -772,7 +772,87 @@ class RobotKontrolApp(ctk.CTk):
             return None
 
         try:
+            import sys
+            import types
+            import re
+
             self.status_message = "Xacro modeli derleniyor..."
+
+            # ROS ortamı olmayan Windows sistemlerinde $(find ...) ve $(find-pkg-share ...)
+            # paket çözümleme hatalarını önlemek için mock ament_index_python ve paket çözücü yapılandırılır
+            def find_package_dir(pkg_name):
+                base_dir = os.path.dirname(os.path.abspath(xacro_path))
+                
+                # 1. Klasör hiyerarşisinde yukarı doğru tara
+                search_dir = base_dir
+                for _ in range(6):
+                    if os.path.basename(search_dir).lower() == pkg_name.lower():
+                        return search_dir
+                    direct_child = os.path.join(search_dir, pkg_name)
+                    if os.path.isdir(direct_child):
+                        return direct_child
+                    parent = os.path.dirname(search_dir)
+                    if parent == search_dir:
+                        break
+                    search_dir = parent
+
+                # 2. Üst klasördeki kardeş paketleri tara
+                parent_dir = os.path.dirname(base_dir)
+                if os.path.isdir(parent_dir):
+                    for entry in os.listdir(parent_dir):
+                        p_full = os.path.join(parent_dir, entry)
+                        if os.path.isdir(p_full) and entry.lower() == pkg_name.lower():
+                            return p_full
+
+                # 3. Bulunamazsa xacro klasörünün bir üstünü (paket kökünü) döndür
+                return parent_dir if os.path.isdir(parent_dir) else base_dir
+
+            # Mock ament_index_python
+            if "ament_index_python" not in sys.modules:
+                ament_mod = types.ModuleType("ament_index_python")
+                pkg_mod = types.ModuleType("ament_index_python.packages")
+                ament_mod.packages = pkg_mod
+                sys.modules["ament_index_python"] = ament_mod
+                sys.modules["ament_index_python.packages"] = pkg_mod
+
+            sys.modules["ament_index_python.packages"].get_package_share_directory = find_package_dir
+
+            # Xacro substitution_args monkey-patch
+            try:
+                import xacro.substitution_args as sa
+                sa._eval_find = find_package_dir
+                if hasattr(sa, "_resolve_args"):
+                    orig_resolve = sa._resolve_args
+                    def patched_resolve_args(arg_str, context, commands):
+                        if "$(" in arg_str:
+                            arg_str = re.sub(r"\$\(find-pkg-share\s+([^)]+)\)", r"$(find \1)", arg_str)
+                            arg_str = re.sub(r"\$\(find-pkg-prefix\s+([^)]+)\)", r"$(find \1)", arg_str)
+                        return orig_resolve(arg_str, context, commands)
+                    sa._resolve_args = patched_resolve_args
+            except Exception:
+                pass
+
+            # Akıllı include çözücü: Eğer include edilen dosya bulunamazsa yerel dizinde ara
+            try:
+                orig_abs = xacro.abs_filename_spec
+                def smart_abs_filename_spec(filename_spec):
+                    resolved = orig_abs(filename_spec)
+                    if not os.path.exists(resolved):
+                        target_name = os.path.basename(filename_spec)
+                        base_dir = os.path.dirname(os.path.abspath(xacro_path))
+                        for search_root in [base_dir, os.path.dirname(base_dir), os.path.dirname(os.path.dirname(base_dir))]:
+                            if not os.path.isdir(search_root):
+                                continue
+                            for root, dirs, files in os.walk(search_root):
+                                if target_name in files:
+                                    return os.path.join(root, target_name)
+                                if root[len(search_root):].count(os.sep) >= 3:
+                                    dirs.clear()
+                    return resolved
+                xacro.abs_filename_spec = smart_abs_filename_spec
+            except Exception:
+                pass
+
             doc = xacro.process_file(xacro_path)
             urdf_content = doc.toxml()
 
@@ -791,8 +871,31 @@ class RobotKontrolApp(ctk.CTk):
 
             return out_path
         except Exception as e:
-            messagebox.showerror("Xacro Derleme Hatası", f"Xacro dosyası URDF'e dönüştürülürken hata oluştu:\n{str(e)}")
-            self.status_message = f"HATA: Xacro derlenemedi ({str(e)})"
+            err_msg = str(e)
+            missing_detail = ""
+            if "No such file or directory" in err_msg or "FileNotFoundError" in str(type(e)):
+                match = re.search(r"['\"]([^'\"]+\.xacro)['\"]", err_msg, re.IGNORECASE)
+                if not match:
+                    match = re.search(r"No such file or directory:\s*([^\r\n]+)", err_msg)
+                missing_target = match.group(1).strip().strip("'\"") if match else "Bağımlı xacro dosyası"
+                missing_filename = os.path.basename(missing_target)
+                
+                missing_detail = (
+                    f"\n\n🔍 AÇIKLAMA:\n"
+                    f"Seçtiğiniz Xacro dosyası başka bir robot paketine bağımlıdır (<xacro:include>):\n"
+                    f"👉 Eksik Dosya / Paket: {missing_filename}\n\n"
+                    f"Bu dosya bilgisayarınızda bulunamadı. Seçtiğiniz '.xacro' dosyası robotun gövdesini tek başına içermeyen, "
+                    f"harici bir robot paketini (örneğin 'ros2srrc_robots' veya 'abb_irb4400_support') çağıran bir üst konfigürasyon dosyasıdır.\n\n"
+                    f"💡 Çözüm:\n"
+                    f"1. Robotun ana gövde makrolarını ve 3D mesh'lerini içeren tam robot paketini indirin, veya\n"
+                    f"2. Robotun doğrudan derlenmiş saf '.urdf' dosyasını yükleyin."
+                )
+
+            messagebox.showerror(
+                "Xacro Derleme Hatası (Eksik Bağımlılık)",
+                f"Xacro dosyası işlenirken hata oluştu:\n{err_msg}{missing_detail}"
+            )
+            self.status_message = f"HATA: Xacro bağımlılığı eksik"
             return None
 
     def open_urdf_file_dialog(self):
