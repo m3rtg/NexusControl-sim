@@ -63,7 +63,13 @@ class RobotKontrolApp(ctk.CTk):
             'transforms': [None] * 7,
             'obstacle':   None,
             'preset':     'standard',   # 'standard' | 'hd' | 'fhd'
+            'cam_dist':   1.8,
+            'cam_target': np.array([0., 0., 0.45]),
+            'cam_yaw':    45.0,
+            'cam_pitch':  -25.0,
+            'grid_size':  1.5,
         }
+        self.robot_reach_cm = 70.0
 
         self.obstacle_id = None
         self.obstacle_pos = [0.0, 0.0, 0.0]
@@ -214,6 +220,13 @@ class RobotKontrolApp(ctk.CTk):
                                          fg_color="transparent")
         self.camera_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
 
+        # Fare ile 3D Görünüm Kontrolleri (Sol tık: Döndür, Sağ tık: Yükseklik, Tekerlek: Zoom)
+        self.camera_label.bind("<ButtonPress-1>", self._on_cam_mouse_down)
+        self.camera_label.bind("<B1-Motion>", self._on_cam_mouse_drag)
+        self.camera_label.bind("<ButtonPress-3>", self._on_cam_right_down)
+        self.camera_label.bind("<B3-Motion>", self._on_cam_right_drag)
+        self.camera_label.bind("<MouseWheel>", self._on_cam_mouse_wheel)
+
         # --- 5. CANLI OSİLOSKOP GRAFİĞİ ---
         self.graph_frame = ctk.CTkFrame(self, fg_color="#1E1E1E", corner_radius=12, border_width=1,
                                         border_color="#2A2A2A")
@@ -243,6 +256,44 @@ class RobotKontrolApp(ctk.CTk):
         self.worker_thread = threading.Thread(target=self.background_engine, daemon=True)
         self.worker_thread.start()
         self.update_ui_loop()
+
+    # ==========================================
+    # 3D KAMERA FARE ETKİLEŞİMİ (ORBIT & ZOOM)
+    # ==========================================
+    def _on_cam_mouse_down(self, event):
+        self._cam_last_x = event.x
+        self._cam_last_y = event.y
+
+    def _on_cam_mouse_drag(self, event):
+        dx = event.x - getattr(self, '_cam_last_x', event.x)
+        dy = event.y - getattr(self, '_cam_last_y', event.y)
+        self._cam_last_x = event.x
+        self._cam_last_y = event.y
+        with self.gpu_state_lock:
+            cur_yaw = float(self.gpu_shared_state.get('cam_yaw', 45.0))
+            cur_pitch = float(self.gpu_shared_state.get('cam_pitch', -25.0))
+            self.gpu_shared_state['cam_yaw'] = (cur_yaw - dx * 0.45) % 360
+            self.gpu_shared_state['cam_pitch'] = max(-89.0, min(89.0, cur_pitch - dy * 0.45))
+
+    def _on_cam_right_down(self, event):
+        self._cam_last_x = event.x
+        self._cam_last_y = event.y
+
+    def _on_cam_right_drag(self, event):
+        dy = event.y - getattr(self, '_cam_last_y', event.y)
+        self._cam_last_y = event.y
+        with self.gpu_state_lock:
+            tgt = np.array(self.gpu_shared_state.get('cam_target', [0., 0., 0.45]), dtype=float)
+            dist = float(self.gpu_shared_state.get('cam_dist', 1.8))
+            tgt[2] += dy * 0.002 * dist
+            self.gpu_shared_state['cam_target'] = tgt
+
+    def _on_cam_mouse_wheel(self, event):
+        delta = -event.delta / 120.0
+        with self.gpu_state_lock:
+            dist = float(self.gpu_shared_state.get('cam_dist', 1.8))
+            factor = 1.12 ** delta
+            self.gpu_shared_state['cam_dist'] = max(0.3, min(40.0, dist * factor))
 
     # ==========================================
     # RENDER KALİTE KONTROLÜ
@@ -541,20 +592,24 @@ class RobotKontrolApp(ctk.CTk):
         except:
             y_val = 0.0
 
-        max_r = 70.0  # Maksimum uzanma (cm)
+        max_r = float(getattr(self, 'robot_reach_cm', 70.0))  # Robotun gerçek ölçeğine göre dinamik uzanma (cm)
+        if hasattr(self, 'lbl_limit_x'):
+            self.lbl_limit_x.configure(text=f"Sınır: ±{max_r:.1f}")
 
         if abs(x_val) >= max_r:
             max_y = 0.0
         else:
             max_y = math.sqrt(max_r ** 2 - x_val ** 2)
-        self.lbl_limit_y.configure(text=f"Maks Y: ±{max_y:.1f}")
+        if hasattr(self, 'lbl_limit_y'):
+            self.lbl_limit_y.configure(text=f"Maks Y: ±{max_y:.1f}")
 
         term_z = max_r ** 2 - x_val ** 2 - y_val ** 2
         if term_z <= 0:
             max_z = 0.0
         else:
             max_z = math.sqrt(term_z)
-        self.lbl_limit_z.configure(text=f"Maks Z: ±{max_z:.1f}")
+        if hasattr(self, 'lbl_limit_z'):
+            self.lbl_limit_z.configure(text=f"Maks Z: ±{max_z:.1f}")
 
     def show_page(self, page_name):
         self.page_manual.pack_forget()
@@ -581,6 +636,7 @@ class RobotKontrolApp(ctk.CTk):
             os.path.dirname(__file__), "..", "fanuc_lrmate200ic_support", "urdf", "fanuc_lrmate200ic.urdf"
         ))
         self.current_urdf_path = self.default_urdf_path
+        self.visual_shapes_meta = []
         self.render_link_names = ['base_link', 'link_1', 'link_2', 'link_3', 'link_4', 'link_5', 'link_6']
 
         self.load_robot_model(self.default_urdf_path, initial=True)
@@ -591,17 +647,32 @@ class RobotKontrolApp(ctk.CTk):
         if isinstance(mesh_filename, bytes):
             mesh_filename = mesh_filename.decode('utf-8')
         if os.path.isabs(mesh_filename) and os.path.exists(mesh_filename):
-            return mesh_filename
+            return os.path.abspath(mesh_filename).replace('\\', '/')
+
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        sim_root = os.path.normpath(os.path.join(app_dir, ".."))
 
         clean_path = mesh_filename
+        pkg_name = ''
         for prefix in ["package://", "model://", "file://"]:
             if clean_path.startswith(prefix):
                 clean_path = clean_path[len(prefix):]
                 parts = clean_path.replace("\\", "/").split("/")
                 if len(parts) > 1:
-                    clean_path = os.path.join(*parts[1:])
+                    pkg_name = parts[0]
+                    clean_path = "/".join(parts[1:])
                 break
 
+        # 1. Simülatör dahili kaynak paketleri (resources/<pkg>/... veya resources/...)
+        if pkg_name:
+            c1 = os.path.join(sim_root, "resources", pkg_name, clean_path)
+            if os.path.isfile(c1):
+                return os.path.abspath(c1).replace("\\", "/")
+            c2 = os.path.join(sim_root, "resources", clean_path)
+            if os.path.isfile(c2):
+                return os.path.abspath(c2).replace("\\", "/")
+
+        # 2. Yerel dosya yolları (urdf_dir ve üst klasörleri)
         candidate_dirs = [
             urdf_dir,
             os.path.normpath(os.path.join(urdf_dir, "..")),
@@ -609,76 +680,78 @@ class RobotKontrolApp(ctk.CTk):
             os.path.normpath(os.path.join(urdf_dir, "..", "meshes")),
             os.path.normpath(os.path.join(urdf_dir, "..", "..")),
         ]
-
         for cdir in candidate_dirs:
             p_check = os.path.normpath(os.path.join(cdir, clean_path))
-            if os.path.exists(p_check):
-                return p_check
+            if os.path.isfile(p_check):
+                return os.path.abspath(p_check).replace("\\", "/")
 
+        # 3. Dosya adına göre tarama (resources, urdf_dir ve Downloads)
         base_name = os.path.basename(mesh_filename)
-        for cdir in candidate_dirs:
-            p_check = os.path.normpath(os.path.join(cdir, base_name))
-            if os.path.exists(p_check):
-                return p_check
-            for sub in ["meshes", "visual", "collision"]:
-                p_sub = os.path.normpath(os.path.join(cdir, sub, base_name))
-                if os.path.exists(p_sub):
-                    return p_sub
+        if pkg_name:
+            pkg_res = os.path.join(sim_root, "resources", pkg_name)
+            if os.path.isdir(pkg_res):
+                for root, dirs, files in os.walk(pkg_res):
+                    if base_name in files:
+                        return os.path.abspath(os.path.join(root, base_name)).replace("\\", "/")
 
-        try:
-            for root, dirs, files in os.walk(os.path.dirname(urdf_dir)):
-                if base_name in files:
-                    return os.path.join(root, base_name)
-        except Exception:
-            pass
+        for root, dirs, files in os.walk(os.path.join(sim_root, "resources")):
+            if base_name in files:
+                return os.path.abspath(os.path.join(root, base_name)).replace("\\", "/")
+
+        for search_root in [os.path.dirname(urdf_dir), os.path.expanduser("~/Downloads")]:
+            if os.path.isdir(search_root):
+                try:
+                    for root, dirs, files in os.walk(search_root):
+                        if base_name in files:
+                            return os.path.abspath(os.path.join(root, base_name)).replace("\\", "/")
+                        if root[len(search_root):].count(os.sep) >= 4:
+                            dirs.clear()
+                except Exception:
+                    pass
 
         return None
 
-    def extract_robot_mesh_data(self, urdf_path):
-        urdf_dir = os.path.dirname(os.path.abspath(urdf_path))
+    def sanitize_and_resolve_urdf(self, urdf_path):
+        """
+        PyBullet C++ URDF ayrıştırıcısının 'cannot find mesh' veya 'Error=XML_ERROR_PARSING_ATTRIBUTE'
+        hatalarıyla çökmesini önler. Tüm mesh yollarını mutlak yola dönüştürür; bulunamayan mesh'ler
+        için güvenli geometrik ilkel yerleştirir ve XML'i düzgün satır aralıklarıyla kaydeder.
+        """
         try:
-            shapes = p.getVisualShapeData(self.robotId)
-        except Exception:
-            shapes = []
+            import xml.etree.ElementTree as ET
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            sim_root = os.path.normpath(os.path.join(app_dir, ".."))
+            cache_dir = os.path.join(sim_root, ".cache")
+            os.makedirs(cache_dir, exist_ok=True)
 
-        link_shapes = {}
-        for s in shapes:
-            link_idx = s[1]
-            mesh_file = s[4]
-            rgba = s[7]
-            resolved_p = None
-            if mesh_file:
-                resolved_p = self.resolve_mesh_path(urdf_dir, mesh_file)
-            col = (float(rgba[0]), float(rgba[1]), float(rgba[2])) if (rgba and any(rgba[:3])) else None
-            link_shapes[link_idx] = (resolved_p, col)
+            urdf_dir = os.path.dirname(os.path.abspath(urdf_path))
+            tree = ET.parse(urdf_path)
+            root = tree.getroot()
 
-        mesh_data = []
-        default_palette = [
-            (0.25, 0.25, 0.25),
-            (0.96, 0.76, 0.13),
-            (0.96, 0.76, 0.13),
-            (0.96, 0.76, 0.13),
-            (0.96, 0.76, 0.13),
-            (0.20, 0.20, 0.20),
-            (0.25, 0.25, 0.25),
-            (0.00, 0.65, 0.85),
-            (0.95, 0.35, 0.10)
-        ]
+            for geom in root.iter("geometry"):
+                mesh = geom.find("mesh")
+                if mesh is not None:
+                    fn = mesh.attrib.get("filename", "")
+                    resolved = self.resolve_mesh_path(urdf_dir, fn)
+                    if resolved and os.path.isfile(resolved):
+                        mesh.attrib["filename"] = os.path.abspath(resolved).replace("\\", "/")
+                    else:
+                        # Eksik mesh için PyBullet çökmesini önleyen yedek silindir
+                        geom.remove(mesh)
+                        cyl = ET.SubElement(geom, "cylinder")
+                        cyl.attrib["radius"] = "0.04"
+                        cyl.attrib["length"] = "0.18"
 
-        link_map = getattr(self, 'link_joint_map', {})
-        for i, link_name in enumerate(self.render_link_names):
-            link_idx = -1 if i == 0 else link_map.get(link_name, i - 1)
-            resolved_path = None
-            color = default_palette[i % len(default_palette)]
-            if link_idx in link_shapes:
-                rp, c = link_shapes[link_idx]
-                if rp and os.path.exists(rp):
-                    resolved_path = rp
-                if c:
-                    color = c
-            mesh_data.append((link_name, resolved_path, color))
-
-        return mesh_data
+            base_name = os.path.splitext(os.path.basename(urdf_path))[0]
+            if base_name.startswith("."):
+                base_name = base_name[1:]
+            sanitized_path = os.path.join(cache_dir, f"sanitized_{base_name}.urdf")
+            ET.indent(tree, space="  ")
+            tree.write(sanitized_path, encoding="utf-8")
+            return sanitized_path
+        except Exception as e:
+            print(f"[URDF Sanitize] Hata: {e}")
+            return urdf_path
 
     def load_robot_model(self, urdf_path, initial=False):
         if not os.path.isfile(urdf_path):
@@ -687,8 +760,13 @@ class RobotKontrolApp(ctk.CTk):
             return False
 
         try:
-            self.status_message = "Robot modeli yükleniyor..."
+            self.status_message = "Robot modeli işleniyor ve yükleniyor..."
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            sim_root = os.path.normpath(os.path.join(app_dir, ".."))
             urdf_dir = os.path.dirname(os.path.abspath(urdf_path))
+
+            # URDF'i PyBullet için sterilize et ve mesh yollarını bağla
+            sanitized_urdf = self.sanitize_and_resolve_urdf(urdf_path)
 
             with self.bullet_lock:
                 if hasattr(self, 'robotId') and self.robotId is not None:
@@ -699,9 +777,11 @@ class RobotKontrolApp(ctk.CTk):
 
                 p.setAdditionalSearchPath(urdf_dir)
                 p.setAdditionalSearchPath(os.path.normpath(os.path.join(urdf_dir, "..")))
+                p.setAdditionalSearchPath(os.path.join(sim_root, "resources"))
+                p.setAdditionalSearchPath(sim_root)
 
                 self.robotId = p.loadURDF(
-                    urdf_path,
+                    sanitized_urdf,
                     [0, 0, 0],
                     p.getQuaternionFromEuler([0, 0, 0]),
                     useFixedBase=True
@@ -721,15 +801,95 @@ class RobotKontrolApp(ctk.CTk):
                 self.end_effector_index = self.revolute_joints[-1] if self.revolute_joints else 0
 
                 self.link_joint_map = {}
-                self.render_link_names = ['base_link']
                 for ji in range(num_joints):
                     info = p.getJointInfo(self.robotId, ji)
                     child_link_name = info[12].decode('utf-8')
                     self.link_joint_map[child_link_name] = ji
-                    if ji in self.revolute_joints:
-                        self.render_link_names.append(child_link_name)
 
-                mesh_data = self.extract_robot_mesh_data(urdf_path)
+                # Görsel şekilleri ve geometrileri çıkar
+                try:
+                    shapes = p.getVisualShapeData(self.robotId)
+                except Exception:
+                    shapes = []
+
+                default_palette = [
+                    (0.25, 0.25, 0.25),
+                    (0.96, 0.76, 0.13),
+                    (0.96, 0.76, 0.13),
+                    (0.96, 0.76, 0.13),
+                    (0.96, 0.76, 0.13),
+                    (0.20, 0.20, 0.20),
+                    (0.25, 0.25, 0.25),
+                    (0.00, 0.65, 0.85),
+                    (0.95, 0.35, 0.10)
+                ]
+
+                self.visual_shapes_meta = []
+                mesh_data = []
+
+                for idx, s in enumerate(shapes):
+                    link_idx = s[1]
+                    geom_type = s[2]
+                    dims = s[3]
+                    mesh_fn = s[4].decode('utf-8') if isinstance(s[4], bytes) else s[4]
+                    resolved_mesh = self.resolve_mesh_path(urdf_dir, mesh_fn) if mesh_fn else None
+                    local_pos = s[5]
+                    local_ori = s[6]
+                    rgba = s[7]
+
+                    col = (float(rgba[0]), float(rgba[1]), float(rgba[2])) if (rgba and any(rgba[:3])) else None
+                    if not col:
+                        # Fanuc CR serisi için karakteristik yeşil/siyah teması
+                        if 'cr35' in urdf_path.lower() or 'cr_' in urdf_path.lower():
+                            col = (0.28, 0.61, 0.43) if link_idx >= 0 else (0.22, 0.22, 0.22)
+                        else:
+                            col = default_palette[idx % len(default_palette)]
+
+                    self.visual_shapes_meta.append({
+                        'link_idx': link_idx,
+                        'geom_type': geom_type,
+                        'dims': dims,
+                        'local_pos': local_pos,
+                        'local_ori': local_ori,
+                    })
+
+                    mesh_data.append({
+                        'name': f'vis_{idx}_link_{link_idx}',
+                        'mesh_path': resolved_mesh,
+                        'color': col,
+                        'geom_type': geom_type,
+                        'dims': dims,
+                    })
+
+                self.render_link_names = [item['name'] for item in mesh_data]
+
+                # ── OTOMATİK KAMERA VE MODEL ÖLÇEKLENDİRME (Auto-Framing) ──
+                min_coords = [float('inf')] * 3
+                max_coords = [float('-inf')] * 3
+                for link_idx in [-1] + list(range(num_joints)):
+                    try:
+                        aabb_min, aabb_max = p.getAABB(self.robotId, link_idx)
+                        for k in range(3):
+                            min_coords[k] = min(min_coords[k], aabb_min[k])
+                            max_coords[k] = max(max_coords[k], aabb_max[k])
+                    except Exception:
+                        pass
+
+                span_x = max_coords[0] - min_coords[0]
+                span_y = max_coords[1] - min_coords[1]
+                span_z = max_coords[2] - min_coords[2]
+                max_span = max(span_x, span_y, span_z)
+                if max_span < 0.1 or max_span > 60.0 or math.isinf(max_span):
+                    max_span = 0.8
+
+                center_z = (max_coords[2] + min_coords[2]) / 2.0
+                if math.isinf(center_z) or math.isnan(center_z):
+                    center_z = 0.45
+
+                auto_cam_dist = max(1.6, float(max_span * 2.2))
+                auto_cam_target = np.array([0.0, 0.0, float(center_z)])
+                auto_grid_size = max(1.5, float(max_span * 1.5))
+                self.robot_reach_cm = max(35.0, float(max(span_x, span_y, span_z * 0.8)) * 100.0)
 
             n_joints = len(self.revolute_joints)
             with self.data_lock:
@@ -737,20 +897,31 @@ class RobotKontrolApp(ctk.CTk):
                 self.position_history = [[0.0] * n_joints]
                 self.history_idx = 0
 
-            if not initial and hasattr(self, 'gpu_renderer'):
-                with self.gpu_state_lock:
-                    self.gpu_shared_state['mesh_data'] = mesh_data
-                    self.gpu_shared_state['reload_meshes'] = True
-                    self.gpu_shared_state['transforms'] = [None] * len(self.render_link_names)
+            with self.gpu_state_lock:
+                self.gpu_shared_state['mesh_data'] = mesh_data
+                self.gpu_shared_state['reload_meshes'] = True
+                self.gpu_shared_state['transforms'] = [None] * len(self.visual_shapes_meta)
+                self.gpu_shared_state['cam_dist'] = auto_cam_dist
+                self.gpu_shared_state['cam_target'] = auto_cam_target
+                self.gpu_shared_state['cam_yaw'] = 45.0
+                self.gpu_shared_state['cam_pitch'] = -25.0
+                self.gpu_shared_state['grid_size'] = auto_grid_size
 
             if hasattr(self, 'slider_card'):
                 self.rebuild_joint_sliders()
 
+            # IK Sınır etiketlerini güncelle
+            self.update_limits()
+
             robot_name = os.path.splitext(os.path.basename(urdf_path))[0]
-            if robot_name.startswith(".") and robot_name.endswith("_generated"):
-                robot_name = robot_name[1:-10]
+            for clean_pfx in [".", "sanitized_", "compiled_"]:
+                if robot_name.startswith(clean_pfx):
+                    robot_name = robot_name[len(clean_pfx):]
+            if robot_name.endswith("_generated"):
+                robot_name = robot_name[:-10]
+
             self.title(f"NexusControl Studio | Model: {robot_name} ({n_joints} Eksen)")
-            self.status_message = f"Model Başarıyla Yüklendi: {robot_name} ({n_joints} Eksen)"
+            self.status_message = f"Model Başarıyla Yüklendi: {robot_name} ({n_joints} Eksen, Boyut: {max_span:.2f}m)"
             return True
 
         except Exception as e:
@@ -782,8 +953,32 @@ class RobotKontrolApp(ctk.CTk):
             # paket çözümleme hatalarını önlemek için mock ament_index_python ve paket çözücü yapılandırılır
             def find_package_dir(pkg_name):
                 base_dir = os.path.dirname(os.path.abspath(xacro_path))
-                
-                # 1. Klasör hiyerarşisinde yukarı doğru tara
+                app_dir = os.path.dirname(os.path.abspath(__file__))
+                sim_root = os.path.normpath(os.path.join(app_dir, ".."))
+
+                # 1. Dahili simülatör kaynak paketleri ve İndirilenler klasörünü kontrol et
+                downloads_dir = os.path.expanduser("~/Downloads")
+                builtin_candidates = [
+                    os.path.join(sim_root, "resources", pkg_name),
+                    os.path.join(sim_root, pkg_name),
+                    os.path.join(downloads_dir, pkg_name),
+                ]
+                for bc in builtin_candidates:
+                    if os.path.isdir(bc):
+                        return bc
+
+                # İndirilenler klasörü altındaki açılmış paketleri tara
+                if os.path.isdir(downloads_dir):
+                    for entry in os.listdir(downloads_dir):
+                        full_p = os.path.join(downloads_dir, entry)
+                        if os.path.isdir(full_p):
+                            if entry.lower() == pkg_name.lower():
+                                return full_p
+                            sub_p = os.path.join(full_p, pkg_name)
+                            if os.path.isdir(sub_p):
+                                return sub_p
+
+                # 2. Klasör hiyerarşisinde yukarı doğru tara
                 search_dir = base_dir
                 for _ in range(6):
                     if os.path.basename(search_dir).lower() == pkg_name.lower():
@@ -796,7 +991,7 @@ class RobotKontrolApp(ctk.CTk):
                         break
                     search_dir = parent
 
-                # 2. Üst klasördeki kardeş paketleri tara
+                # 3. Üst klasördeki kardeş paketleri tara
                 parent_dir = os.path.dirname(base_dir)
                 if os.path.isdir(parent_dir):
                     for entry in os.listdir(parent_dir):
@@ -804,7 +999,7 @@ class RobotKontrolApp(ctk.CTk):
                         if os.path.isdir(p_full) and entry.lower() == pkg_name.lower():
                             return p_full
 
-                # 3. Bulunamazsa xacro klasörünün bir üstünü (paket kökünü) döndür
+                # 4. Bulunamazsa xacro klasörünün bir üstünü (paket kökünü) döndür
                 return parent_dir if os.path.isdir(parent_dir) else base_dir
 
             # Mock ament_index_python
@@ -840,6 +1035,19 @@ class RobotKontrolApp(ctk.CTk):
                     if not os.path.exists(resolved):
                         target_name = os.path.basename(filename_spec)
                         base_dir = os.path.dirname(os.path.abspath(xacro_path))
+                        app_dir = os.path.dirname(os.path.abspath(__file__))
+                        sim_root = os.path.normpath(os.path.join(app_dir, ".."))
+
+                        # Standart materyal/renk dosyaları için dahili kaynak kontrolü
+                        if target_name in ["common_materials.xacro", "common_colours.xacro"]:
+                            for r_dir in [
+                                os.path.join(sim_root, "resources", "fanuc_resources", "urdf"),
+                                os.path.join(sim_root, "resources", "abb_resources", "urdf")
+                            ]:
+                                cand = os.path.join(r_dir, target_name)
+                                if os.path.isfile(cand):
+                                    return cand
+
                         for search_root in [base_dir, os.path.dirname(base_dir), os.path.dirname(os.path.dirname(base_dir))]:
                             if not os.path.isdir(search_root):
                                 continue
@@ -856,18 +1064,16 @@ class RobotKontrolApp(ctk.CTk):
             doc = xacro.process_file(xacro_path)
             urdf_content = doc.toxml()
 
-            base_dir = os.path.dirname(os.path.abspath(xacro_path))
-            file_name = os.path.splitext(os.path.basename(xacro_path))[0]
-            out_path = os.path.join(base_dir, f".{file_name}_generated.urdf")
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            sim_root = os.path.normpath(os.path.join(app_dir, ".."))
+            cache_dir = os.path.join(sim_root, ".cache")
+            os.makedirs(cache_dir, exist_ok=True)
 
-            try:
-                with open(out_path, "w", encoding="utf-8") as f:
-                    f.write(urdf_content)
-            except Exception:
-                import tempfile
-                out_path = os.path.join(tempfile.gettempdir(), f"{file_name}_generated.urdf")
-                with open(out_path, "w", encoding="utf-8") as f:
-                    f.write(urdf_content)
+            file_name = os.path.splitext(os.path.basename(xacro_path))[0]
+            out_path = os.path.join(cache_dir, f"compiled_{file_name}.urdf")
+
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(urdf_content)
 
             return out_path
         except Exception as e:
@@ -1313,20 +1519,20 @@ class RobotKontrolApp(ctk.CTk):
             if current_time - last_transform_time >= (1.0 / 60.0):
                 last_transform_time = current_time
 
-                transforms = [None] * len(self.render_link_names)
+                shapes_meta = getattr(self, 'visual_shapes_meta', [])
+                transforms = [None] * len(shapes_meta)
                 with self.bullet_lock:
-                    # base_link (index 0)
                     base_pos, base_quat = p.getBasePositionAndOrientation(self.robotId)
-                    transforms[0] = quat_to_mat4(base_pos, base_quat)
-
-                    # Dynamic child links
-                    for idx, link_name in enumerate(self.render_link_names[1:]):
-                        if link_name in self.link_joint_map:
-                            ji = self.link_joint_map[link_name]
-                            ls = p.getLinkState(self.robotId, ji)
-                            transforms[idx + 1] = quat_to_mat4(ls[4], ls[5])
+                    for idx, meta in enumerate(shapes_meta):
+                        link_idx = meta['link_idx']
+                        local_pos = meta.get('local_pos', (0., 0., 0.))
+                        local_ori = meta.get('local_ori', (0., 0., 0., 1.))
+                        if link_idx == -1:
+                            w_pos, w_quat = p.multiplyTransforms(base_pos, base_quat, local_pos, local_ori)
                         else:
-                            transforms[idx + 1] = transforms[0]
+                            ls = p.getLinkState(self.robotId, link_idx)
+                            w_pos, w_quat = p.multiplyTransforms(ls[4], ls[5], local_pos, local_ori)
+                        transforms[idx] = quat_to_mat4(w_pos, w_quat)
 
                     # also refresh current_joints for telemetry
                     js_all = p.getJointStates(self.robotId, self.revolute_joints)

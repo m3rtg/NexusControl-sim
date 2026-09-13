@@ -186,13 +186,14 @@ class RobotGPURenderer:
             except Exception as e:
                 print(f'[GPURender] {name}: {e}')
 
-        grid_vao = ctx.vertex_array(grid_prog, [(ctx.buffer(_grid_verts().tobytes()), '3f', 'in_pos')])
+        cur_grid_size = 1.5
+        grid_vao = ctx.vertex_array(grid_prog, [(ctx.buffer(_grid_verts(size=cur_grid_size, step=0.2).tobytes()), '3f', 'in_pos')])
         axis_vao = ctx.vertex_array(axis_prog, [(ctx.buffer(_axis_verts().tobytes()), '3f 3f', 'in_pos', 'in_col')])
 
         box_vao = None; box_vbo = None; box_key = None
         cur_rw, cur_rh = 640, 800
         fbo = self._make_fbo(ctx, cur_rw, cur_rh)
-        cam_yaw, cam_pitch, cam_dist = 45.0, -30.0, 1.8
+        cam_yaw, cam_pitch, cam_dist = 45.0, -25.0, 1.8
         cam_target = np.array([0., 0., 0.45])
         last_t = time.perf_counter()
 
@@ -203,9 +204,25 @@ class RobotGPURenderer:
                 transforms = self.shared.get('transforms', [None] * len(current_link_names))
                 obstacle = self.shared.get('obstacle', None)
                 preset = self.shared.get('preset', 'standard')
+
+                cam_dist = float(self.shared.get('cam_dist', cam_dist))
+                raw_tgt = self.shared.get('cam_target', cam_target)
+                if raw_tgt is not None:
+                    cam_target = np.asarray(raw_tgt, dtype=np.float64)
+                cam_yaw = float(self.shared.get('cam_yaw', cam_yaw))
+                cam_pitch = float(self.shared.get('cam_pitch', cam_pitch))
+                new_grid_size = float(self.shared.get('grid_size', cur_grid_size))
+
                 if self.shared.get('reload_meshes', False):
                     new_mesh_data = self.shared.get('mesh_data', [])
                     self.shared['reload_meshes'] = False
+
+            # Izgara boyutunu robot ölçeğine göre güncelle
+            if abs(new_grid_size - cur_grid_size) > 0.05:
+                cur_grid_size = new_grid_size
+                step = max(0.1, cur_grid_size / 8.0)
+                grid_vao.release()
+                grid_vao = ctx.vertex_array(grid_prog, [(ctx.buffer(_grid_verts(size=cur_grid_size, step=step).tobytes()), '3f', 'in_pos')])
 
             # Dinamik model yükleme talebi geldiğinde VAO'ları güncelle
             if new_mesh_data is not None:
@@ -219,31 +236,51 @@ class RobotGPURenderer:
                 current_link_names = []
 
                 for item in new_mesh_data:
-                    name = item[0]
-                    mesh_src = item[1]
-                    col = item[2] if len(item) > 2 and item[2] else (0.85, 0.85, 0.85)
-                    current_link_names.append(name)
+                    if isinstance(item, dict):
+                        name = item.get('name', 'link')
+                        mesh_src = item.get('mesh_path')
+                        col = item.get('color', (0.85, 0.85, 0.85))
+                        geom_type = item.get('geom_type', 5)
+                        dims = item.get('dims', (0.1, 0.1, 0.1))
+                    else:
+                        name = item[0]
+                        mesh_src = item[1]
+                        col = item[2] if len(item) > 2 and item[2] else (0.85, 0.85, 0.85)
+                        geom_type = item[3] if len(item) > 3 else 5
+                        dims = item[4] if len(item) > 4 else (0.1, 0.1, 0.1)
 
+                    current_link_names.append(name)
                     vao = None
+
                     if mesh_src and isinstance(mesh_src, str) and os.path.isfile(mesh_src):
                         try:
                             vao = self._load_vao(ctx, prog, mesh_src)
                         except Exception as e:
                             print(f'[GPURender] Mesh okunamadı ({name}): {e}')
 
-                    # Eğer mesh dosyası yoksa veya yüklenemediyse fallback görsel geometri oluştur
+                    # Eğer mesh dosyası yoksa veya geometrik ilkel ise prosedürel geometri oluştur
                     if vao is None:
                         try:
-                            cyl = trimesh.creation.cylinder(radius=0.035, height=0.09)
-                            v = np.asarray(cyl.vertices, dtype=np.float32)
-                            n = np.asarray(cyl.vertex_normals, dtype=np.float32)
-                            f = np.asarray(cyl.faces, dtype=np.uint32)
+                            if geom_type == 3:  # GEOM_BOX
+                                hx, hy, hz = dims[0], dims[1], dims[2]
+                                mesh_obj = trimesh.creation.box(extents=[max(0.01, hx * 2), max(0.01, hy * 2), max(0.01, hz * 2)])
+                            elif geom_type == 4:  # GEOM_CYLINDER
+                                length, radius = dims[0], dims[1]
+                                mesh_obj = trimesh.creation.cylinder(radius=max(0.005, radius), height=max(0.01, length))
+                            elif geom_type == 2:  # GEOM_SPHERE
+                                mesh_obj = trimesh.creation.icosphere(radius=max(0.005, dims[0]))
+                            else:
+                                mesh_obj = trimesh.creation.cylinder(radius=0.035, height=0.09)
+
+                            v = np.asarray(mesh_obj.vertices, dtype=np.float32)
+                            n = np.asarray(mesh_obj.vertex_normals, dtype=np.float32)
+                            f = np.asarray(mesh_obj.faces, dtype=np.uint32)
                             data = np.hstack([v, n]).astype(np.float32)
                             vbo = ctx.buffer(data.tobytes())
                             ibo = ctx.buffer(f.tobytes())
                             vao = ctx.vertex_array(prog, [(vbo, '3f 3f', 'in_position', 'in_normal')], ibo)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f'[GPURender] Prosedürel VAO hatası ({name}): {e}')
 
                     if vao is not None:
                         robot_vaos[name] = (vao, col)
@@ -254,14 +291,14 @@ class RobotGPURenderer:
                 fbo.release(); cur_rw, cur_rh = rw, rh; fbo = self._make_fbo(ctx, cur_rw, cur_rh)
             eye = _eye_pos(cam_target, cam_yaw, cam_pitch, cam_dist)
             view = _look_at(eye, cam_target)
-            proj = _perspective(60.0, cur_rw / cur_rh, 0.01, 100.0)
+            proj = _perspective(60.0, cur_rw / cur_rh, 0.01, max(100.0, cam_dist * 10.0))
             view_b = view.T.astype(np.float32).tobytes()
             proj_b = proj.T.astype(np.float32).tobytes()
             fbo.use(); ctx.viewport = (0, 0, cur_rw, cur_rh); ctx.clear(0.098, 0.098, 0.098, 1.0)
             prog['u_view'].write(view_b); prog['u_proj'].write(proj_b)
-            prog['u_light_pos'].value = (2.5, 2.0, 4.5)
+            prog['u_light_pos'].value = (cam_dist * 0.8, cam_dist * 0.6, cam_dist * 1.5)
             prog['u_view_pos'].value = tuple(float(e) for e in eye)
-            prog['u_ambient'].value = 0.28
+            prog['u_ambient'].value = 0.35
             for i, name in enumerate(current_link_names):
                 T = (transforms[i] if (transforms and i < len(transforms) and transforms[i] is not None) else np.eye(4, dtype=np.float32))
                 prog['u_model'].write(T.T.astype(np.float32).tobytes())
