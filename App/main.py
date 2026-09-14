@@ -32,8 +32,8 @@ class RobotKontrolApp(ctk.CTk):
         self.history_idx = 0
         self.shared_targets = [0.0] * 6
 
-        self.data_lock = threading.Lock()
-        self.bullet_lock = threading.Lock()
+        self.data_lock = threading.RLock()
+        self.bullet_lock = threading.RLock()
 
         self.q_img = queue.Queue(maxsize=1)
         self.q_telemetry = queue.Queue(maxsize=1)
@@ -57,8 +57,18 @@ class RobotKontrolApp(ctk.CTk):
         self.current_power = 0.0
         self.e_stop_active = False
 
+        # Motor, Yük ve Enerji Maliyet Sistemi
+        self.payload_kg = 0.0
+        self.base_ee_mass = 1.0
+        self.motor_efficiency = 0.85
+        self.motor_standby_w = 15.0
+        self.electricity_rate = 4.50
+        self.cumulative_energy_joules = 0.0
+        self.cumulative_energy_kwh = 0.0
+        self.cumulative_cost_tl = 0.0
+
         # GPU Renderer paylaşılan durum
-        self.gpu_state_lock = threading.Lock()
+        self.gpu_state_lock = threading.RLock()
         self.gpu_shared_state = {
             'running':    True,
             'transforms': [None] * 7,
@@ -70,7 +80,14 @@ class RobotKontrolApp(ctk.CTk):
             'cam_pitch':  -25.0,
             'grid_size':  1.5,
         }
-        self.robot_reach_cm = 70.0
+        self.shoulder_r_cm = 7.5
+        self.shoulder_z_cm = 33.0
+        self.arm_length_cm = 72.5
+        self.robot_reach_cm = 80.0
+        self.base_z_cm = 33.0
+        self.stand_top_cm = 0.0
+        self.stand_half_extent_cm = 0.0
+        self.min_safe_z_cm = 5.0
 
         self.obstacle_id = None
         self.obstacle_pos = [0.0, 0.0, 0.0]
@@ -80,10 +97,10 @@ class RobotKontrolApp(ctk.CTk):
         # ==========================================
         self.grid_rowconfigure(0, weight=4)
         self.grid_rowconfigure(1, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=2)
-        self.grid_columnconfigure(2, weight=3)
-        self.grid_columnconfigure(3, weight=3)
+        self.grid_columnconfigure(0, weight=0, minsize=180)
+        self.grid_columnconfigure(1, weight=3, minsize=310)
+        self.grid_columnconfigure(2, weight=2, minsize=240)
+        self.grid_columnconfigure(3, weight=4, minsize=320)
 
         # --- 1. NAVBAR ---
         self.sidebar = ctk.CTkFrame(self, corner_radius=0, fg_color="#141414")
@@ -109,23 +126,23 @@ class RobotKontrolApp(ctk.CTk):
         # --- NAVBAR BUTONLARI ---
         self.btn_nav_manual = ctk.CTkButton(self.sidebar, text="Manuel Kontrol", height=40, corner_radius=8,
                                             command=lambda: self.show_page("manual"))
-        self.btn_nav_manual.pack(pady=8, padx=20, fill="x")
+        self.btn_nav_manual.pack(pady=8, padx=10, fill="x")
 
         self.btn_nav_fk = ctk.CTkButton(self.sidebar, text="İleri Kinematik", height=40, corner_radius=8,
                                         command=lambda: self.show_page("fk"))
-        self.btn_nav_fk.pack(pady=8, padx=20, fill="x")
+        self.btn_nav_fk.pack(pady=8, padx=10, fill="x")
 
         self.btn_nav_ik = ctk.CTkButton(self.sidebar, text="Ters Kinematik", height=40, corner_radius=8,
                                         command=lambda: self.show_page("ik"))
-        self.btn_nav_ik.pack(pady=8, padx=20, fill="x")
+        self.btn_nav_ik.pack(pady=8, padx=10, fill="x")
 
         self.btn_nav_workspace = ctk.CTkButton(self.sidebar, text="Saydam İzi Göster", height=40, corner_radius=8,
                                                fg_color="#005A9E", hover_color="#003A68", command=self.toggle_workspace)
-        self.btn_nav_workspace.pack(pady=(20, 8), padx=20, fill="x")
+        self.btn_nav_workspace.pack(pady=(20, 8), padx=10, fill="x")
 
         # --- DİNAMİK ENGEL BUTONLARI ---
         obs_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        obs_frame.pack(pady=8, padx=20, fill="x")
+        obs_frame.pack(pady=8, padx=10, fill="x")
         obs_frame.grid_columnconfigure(0, weight=3)
         obs_frame.grid_columnconfigure(1, weight=1)
 
@@ -140,7 +157,7 @@ class RobotKontrolApp(ctk.CTk):
         # E-STOP SIFIRLAMA
         self.btn_estop_reset = ctk.CTkButton(self.sidebar, text="E-STOP SIFIRLA", height=40, corner_radius=8,
                                              fg_color="#8B0000", hover_color="#550000", command=self.reset_estop)
-        self.btn_estop_reset.pack(pady=(20, 8), padx=20, fill="x")
+        self.btn_estop_reset.pack(pady=(20, 8), padx=10, fill="x")
 
         # --- RENDER KALİTE SEÇİCİ ---
         qual_lbl = ctk.CTkLabel(self.sidebar, text="RENDER KALİTESİ",
@@ -159,7 +176,7 @@ class RobotKontrolApp(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI", size=12)
         )
         self.quality_menu.set("Standard (640p)")
-        self.quality_menu.pack(pady=(0, 6), padx=20, fill="x")
+        self.quality_menu.pack(pady=(0, 6), padx=10, fill="x")
 
         self.lbl_qual_info = ctk.CTkLabel(self.sidebar, text="640p native · GPU · 60 FPS",
                                           font=ctk.CTkFont(family="Consolas", size=10),
@@ -175,11 +192,11 @@ class RobotKontrolApp(ctk.CTk):
         self.btn_load_urdf = ctk.CTkButton(self.sidebar, text="📁 Model Yükle (URDF / Xacro)", height=34, corner_radius=8,
                                            fg_color="#1E4D2B", hover_color="#163820",
                                            command=self.open_urdf_file_dialog)
-        self.btn_load_urdf.pack(pady=3, padx=20, fill="x")
+        self.btn_load_urdf.pack(pady=3, padx=10, fill="x")
 
         # Varsayılan Yap & Fabrikaya Dön Butonları
         btn_model_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        btn_model_frame.pack(pady=3, padx=20, fill="x")
+        btn_model_frame.pack(pady=3, padx=10, fill="x")
         btn_model_frame.grid_columnconfigure(0, weight=1)
         btn_model_frame.grid_columnconfigure(1, weight=1)
 
@@ -208,7 +225,7 @@ class RobotKontrolApp(ctk.CTk):
 
         self.page_manual = ctk.CTkFrame(self.pages_frame, fg_color="transparent")
         self.page_fk = ctk.CTkFrame(self.pages_frame, fg_color="transparent")
-        self.page_ik = ctk.CTkFrame(self.pages_frame, fg_color="transparent")
+        self.page_ik = ctk.CTkScrollableFrame(self.pages_frame, fg_color="transparent")
 
         self.setup_manual_page()
         self.setup_fk_page()
@@ -219,14 +236,22 @@ class RobotKontrolApp(ctk.CTk):
                                            border_color="#2A2A2A")
         self.analysis_frame.grid(row=0, column=2, padx=10, pady=(15, 5), sticky="nsew")
 
-        self.analysis_title = ctk.CTkLabel(self.analysis_frame, text="SİSTEM TELEMETRİSİ & ANALİZİ",
-                                           font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"))
-        self.analysis_title.pack(pady=(15, 10))
+        self.analysis_title = ctk.CTkLabel(self.analysis_frame, text="SİSTEM & ANALİZ",
+                                           font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"))
+        self.analysis_title.pack(pady=(10, 4))
 
-        self.analysis_box = ctk.CTkTextbox(self.analysis_frame, font=ctk.CTkFont(family="Consolas", size=13),
-                                           fg_color="#0A0A0A", text_color="#00FFCC", corner_radius=8, border_width=1,
-                                           border_color="#1F1F1F")
-        self.analysis_box.pack(padx=15, pady=(0, 15), fill="both", expand=True)
+        # Canlı Telemetri Kartı (Sabit boy, kaydırma çubuğu yok, anlık ve hafif güncelleme)
+        self.telemetry_box = ctk.CTkTextbox(self.analysis_frame, height=135,
+                                            font=ctk.CTkFont(family="Consolas", size=11),
+                                            fg_color="#0A0A0A", text_color="#00FFCC", corner_radius=8,
+                                            border_width=1, border_color="#1F1F1F", activate_scrollbars=False)
+        self.telemetry_box.pack(padx=12, pady=(0, 6), fill="x")
+
+        # Statik Matematik ve Güvenlik Raporu (Sadece IK/FK hesaplandığında güncellenir, akıcı kaydırma)
+        self.analysis_box = ctk.CTkTextbox(self.analysis_frame, font=ctk.CTkFont(family="Consolas", size=11),
+                                           fg_color="#0A0A0A", text_color="#CCCCCC", corner_radius=8,
+                                           border_width=1, border_color="#1F1F1F")
+        self.analysis_box.pack(padx=12, pady=(0, 12), fill="both", expand=True)
 
         # --- 4. 3D ROBOT GÖRÜNÜMÜ ---
         self.render_frame = ctk.CTkFrame(self, fg_color="#1A1A1A", corner_radius=12, border_width=1,
@@ -251,10 +276,32 @@ class RobotKontrolApp(ctk.CTk):
                                         border_color="#2A2A2A")
         self.graph_frame.grid(row=1, column=1, columnspan=3, padx=15, pady=(5, 15), sticky="nsew")
 
-        self.graph_label = ctk.CTkLabel(self.graph_frame, text="CANLI MOTOR GÜÇ TÜKETİMİ (WATT)",
+        # Osiloskop Üst Çubuğu (Başlık + Canlı Sayaç + Sıfırla Butonu)
+        self.graph_header = ctk.CTkFrame(self.graph_frame, fg_color="transparent")
+        self.graph_header.pack(fill="x", padx=15, pady=(5, 2))
+        self.graph_header.grid_columnconfigure(0, weight=1)
+        self.graph_header.grid_columnconfigure(1, weight=2)
+        self.graph_header.grid_columnconfigure(2, weight=0)
+
+        self.graph_label = ctk.CTkLabel(self.graph_header, text="⚡ CANLI MOTOR GÜÇ TÜKETİMİ (WATT)",
                                         font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
                                         text_color="#AAAAAA")
-        self.graph_label.pack(pady=(5, 0))
+        self.graph_label.grid(row=0, column=0, sticky="w")
+
+        self.lbl_energy_summary = ctk.CTkLabel(
+            self.graph_header,
+            text="Anlık: 0.0 W  |  Sayaç: 0.000 kWh  |  Maliyet: 0.00 TL",
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            text_color="#00FFCC"
+        )
+        self.lbl_energy_summary.grid(row=0, column=1, sticky="e", padx=15)
+
+        self.btn_reset_energy = ctk.CTkButton(
+            self.graph_header, text="↺ Sıfırla", width=65, height=24, corner_radius=6,
+            font=ctk.CTkFont(size=10), fg_color="#2A2A2A", hover_color="#3A3A3A",
+            command=self.reset_energy_counter
+        )
+        self.btn_reset_energy.grid(row=0, column=2, sticky="e")
 
         self.canvas = tk.Canvas(self.graph_frame, bg="#0A0A0A", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=10, pady=10)
@@ -450,6 +497,33 @@ class RobotKontrolApp(ctk.CTk):
     # ==========================================
     # SAYFA TASARIMLARI
     # ==========================================
+    def make_scroll_smooth(self, scrollable_frame, step_px=50):
+        """
+        CTkScrollableFrame ve içindeki tüm alt bileşenlere (slider, label vb.)
+        akıcı, kesintisiz ve takılmayan MouseWheel kaydırma desteği bağlar.
+        """
+        def _on_wheel(event):
+            try:
+                canvas = getattr(scrollable_frame, '_parent_canvas', None)
+                if canvas is not None:
+                    delta = getattr(event, 'delta', 0)
+                    if delta != 0:
+                        units = -int((delta / 120.0) * step_px)
+                        canvas.yview_scroll(units, "units")
+            except Exception:
+                pass
+            return "break"  # Global CTk çakışmasını ve takılmaları önler
+
+        def _bind_all_children(widget):
+            widget.bind("<MouseWheel>", _on_wheel, add="+")
+            for child in widget.winfo_children():
+                _bind_all_children(child)
+
+        _bind_all_children(scrollable_frame)
+        canvas = getattr(scrollable_frame, '_parent_canvas', None)
+        if canvas is not None:
+            canvas.bind("<MouseWheel>", _on_wheel, add="+")
+
     def setup_manual_page(self):
         title = ctk.CTkLabel(self.page_manual, text="Eksen Manipülasyonu", font=ctk.CTkFont(size=18, weight="bold"))
         title.pack(pady=(10, 15))
@@ -524,6 +598,8 @@ class RobotKontrolApp(ctk.CTk):
             slider.bind("<ButtonRelease-1>", lambda event: self.save_position())
             self.sliders.append(slider)
 
+        self.make_scroll_smooth(self.slider_card, step_px=50)
+
     def setup_fk_page(self):
         title = ctk.CTkLabel(self.page_fk, text="İleri Kinematik Modülü", font=ctk.CTkFont(size=18, weight="bold"))
         title.pack(pady=(10, 20))
@@ -536,99 +612,278 @@ class RobotKontrolApp(ctk.CTk):
         self.btn_calc_fk.pack(pady=10, fill="x")
 
     def setup_ik_page(self):
-        title = ctk.CTkLabel(self.page_ik, text="Ters Kinematik Otonom Motoru",
-                             font=ctk.CTkFont(size=18, weight="bold"))
-        title.pack(pady=(10, 15))
+        title = ctk.CTkLabel(self.page_ik, text="Ters Kinematik (IK)",
+                             font=ctk.CTkFont(size=16, weight="bold"))
+        title.pack(pady=(10, 12))
 
         ik_card = ctk.CTkFrame(self.page_ik, fg_color="#242424", corner_radius=10)
         ik_card.pack(fill="x", pady=(0, 10))
 
-        # --- YENİ: DİNAMİK SINIR GÖSTERGELERİ (TEXTBOX YANINDA) ---
+        # --- SINIR GÖSTERGELERİ (TEXTBOX YANINDA) ---
         self.var_x = ctk.StringVar()
         self.var_y = ctk.StringVar()
+        self.var_z = ctk.StringVar()
         self.var_x.trace_add("write", self.update_limits)
         self.var_y.trace_add("write", self.update_limits)
+        self.var_z.trace_add("write", self.update_limits)
 
         # X Kutusu
         frame_x = ctk.CTkFrame(ik_card, fg_color="transparent")
         frame_x.pack(fill="x", padx=15, pady=(15, 5))
-        self.entry_x = ctk.CTkEntry(frame_x, placeholder_text="Hedef X (Örn: 30.0 cm)", textvariable=self.var_x,
+        self.entry_x = ctk.CTkEntry(frame_x, placeholder_text="Hedef X (cm)", textvariable=self.var_x,
                                     height=38, border_color="#444")
         self.entry_x.pack(side="left", fill="x", expand=True)
-        self.lbl_limit_x = ctk.CTkLabel(frame_x, text="Sınır: ±70.0", text_color="gray", width=90)
-        self.lbl_limit_x.pack(side="right", padx=(10, 0))
+        self.lbl_limit_x = ctk.CTkLabel(frame_x, text="±80 cm", text_color="gray", width=100, font=ctk.CTkFont(size=11), anchor="e")
+        self.lbl_limit_x.pack(side="right", padx=(8, 0))
 
         # Y Kutusu
         frame_y = ctk.CTkFrame(ik_card, fg_color="transparent")
         frame_y.pack(fill="x", padx=15, pady=5)
-        self.entry_y = ctk.CTkEntry(frame_y, placeholder_text="Hedef Y (Örn: 0.0 cm)", textvariable=self.var_y,
+        self.entry_y = ctk.CTkEntry(frame_y, placeholder_text="Hedef Y (cm)", textvariable=self.var_y,
                                     height=38, border_color="#444")
         self.entry_y.pack(side="left", fill="x", expand=True)
-        self.lbl_limit_y = ctk.CTkLabel(frame_y, text="Maks Y: ±70.0", text_color="gray", width=90)
-        self.lbl_limit_y.pack(side="right", padx=(10, 0))
+        self.lbl_limit_y = ctk.CTkLabel(frame_y, text="±80 cm", text_color="gray", width=100, font=ctk.CTkFont(size=11), anchor="e")
+        self.lbl_limit_y.pack(side="right", padx=(8, 0))
 
         # Z Kutusu
         frame_z = ctk.CTkFrame(ik_card, fg_color="transparent")
-        frame_z.pack(fill="x", padx=15, pady=(5, 15))
-        self.entry_z = ctk.CTkEntry(frame_z, placeholder_text="Hedef Z (Örn: 40.0 cm)", height=38, border_color="#444")
+        frame_z.pack(fill="x", padx=15, pady=5)
+        self.entry_z = ctk.CTkEntry(frame_z, placeholder_text="Hedef Z (cm)", textvariable=self.var_z,
+                                    height=38, border_color="#444")
         self.entry_z.pack(side="left", fill="x", expand=True)
-        self.lbl_limit_z = ctk.CTkLabel(frame_z, text="Maks Z: ±70.0", text_color="gray", width=90)
-        self.lbl_limit_z.pack(side="right", padx=(10, 0))
+        self.lbl_limit_z = ctk.CTkLabel(frame_z, text="0 - 106 cm", text_color="gray", width=100, font=ctk.CTkFont(size=11), anchor="e")
+        self.lbl_limit_z.pack(side="right", padx=(8, 0))
+
+        # 3B Anlık Erişim Bilgilendirme Çubuğu
+        self.lbl_reach_status = ctk.CTkLabel(
+            ik_card, text="● Hedef koordinatları girin\n3B uzanma analizi bekleniyor",
+            font=ctk.CTkFont(size=11), text_color="gray",
+            anchor="w", justify="left"
+        )
+        self.lbl_reach_status.pack(fill="x", pady=(4, 10), padx=15)
+
+        # --- MOTOR, YÜK & MALİYET AYARLARI KARTI ---
+        motor_card = ctk.CTkFrame(self.page_ik, fg_color="#242424", corner_radius=10)
+        motor_card.pack(fill="x", pady=(0, 10))
+
+        lbl_motor_title = ctk.CTkLabel(
+            motor_card, text="⚙️ YÜK VE ENERJİ AYARLARI",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            text_color="#FFB300"
+        )
+        lbl_motor_title.pack(pady=(8, 4), padx=15, anchor="w")
+
+        row1 = ctk.CTkFrame(motor_card, fg_color="transparent")
+        row1.pack(fill="x", padx=15, pady=(2, 4))
+        row1.grid_columnconfigure(0, weight=1)
+        row1.grid_columnconfigure(1, weight=1)
+
+        # Yük (Payload)
+        p_frame = ctk.CTkFrame(row1, fg_color="transparent")
+        p_frame.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ctk.CTkLabel(p_frame, text="Yük (Payload - kg):", font=ctk.CTkFont(size=11), text_color="#AAAAAA").pack(anchor="w")
+        self.entry_payload = ctk.CTkEntry(p_frame, placeholder_text="0.0", height=32)
+        self.entry_payload.insert(0, "0.0")
+        self.entry_payload.pack(fill="x", pady=(2, 0))
+
+        # Elektrik Birim Fiyatı (TL/kWh)
+        t_frame = ctk.CTkFrame(row1, fg_color="transparent")
+        t_frame.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        ctk.CTkLabel(t_frame, text="Tarife (TL / kWh):", font=ctk.CTkFont(size=11), text_color="#AAAAAA").pack(anchor="w")
+        self.entry_tariff = ctk.CTkEntry(t_frame, placeholder_text="4.50", height=32)
+        self.entry_tariff.insert(0, "4.50")
+        self.entry_tariff.pack(fill="x", pady=(2, 0))
+
+        row2 = ctk.CTkFrame(motor_card, fg_color="transparent")
+        row2.pack(fill="x", padx=15, pady=(2, 8))
+        row2.grid_columnconfigure(0, weight=1)
+        row2.grid_columnconfigure(1, weight=1)
+
+        # Motor Verimi (%)
+        eff_frame = ctk.CTkFrame(row2, fg_color="transparent")
+        eff_frame.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ctk.CTkLabel(eff_frame, text="Motor Verimi (%):", font=ctk.CTkFont(size=11), text_color="#AAAAAA").pack(anchor="w")
+        self.entry_efficiency = ctk.CTkEntry(eff_frame, placeholder_text="85", height=32)
+        self.entry_efficiency.insert(0, "85")
+        self.entry_efficiency.pack(fill="x", pady=(2, 0))
+
+        # Yükü Uygula Butonu
+        self.btn_apply_payload = ctk.CTkButton(
+            row2, text="⚡ Güncelle", height=32, corner_radius=6,
+            fg_color="#332B10", hover_color="#4A3E14", text_color="#FFD700",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.apply_payload_settings
+        )
+        self.btn_apply_payload.grid(row=0, column=1, sticky="se", padx=(5, 0))
 
         self.btn_calc_ik = ctk.CTkButton(self.page_ik, text="Yörünge ve Rotayı Hesapla", height=42, corner_radius=8,
                                          command=self.calculate_ik)
-        self.btn_calc_ik.pack(pady=(10, 10), fill="x")
+        self.btn_calc_ik.pack(pady=(5, 10), fill="x")
 
         self.traj_frame = ctk.CTkFrame(self.page_ik, fg_color="transparent")
         self.traj_frame.pack(fill="x", padx=10, pady=(5, 15))
         self.traj_frame.grid_columnconfigure(0, weight=1)
         self.traj_frame.grid_columnconfigure(1, weight=1)
 
-        self.btn_fast_traj = ctk.CTkButton(self.traj_frame, text="Hızlı Rotayı Başlat", height=38, corner_radius=6,
+        self.btn_fast_traj = ctk.CTkButton(self.traj_frame, text="⚡ Hızlı Rota", height=38, corner_radius=6,
+                                           font=ctk.CTkFont(size=12, weight="bold"),
                                            fg_color="#8B0000", hover_color="#660000", state="disabled",
                                            command=lambda: self.execute_trajectory("fast"))
-        self.btn_fast_traj.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        self.btn_fast_traj.grid(row=0, column=0, padx=(0, 4), sticky="ew")
 
-        self.btn_eco_traj = ctk.CTkButton(self.traj_frame, text="Ekonomik Rotayı Başlat", height=38, corner_radius=6,
+        self.btn_eco_traj = ctk.CTkButton(self.traj_frame, text="🌱 Eko Rota", height=38, corner_radius=6,
+                                          font=ctk.CTkFont(size=12, weight="bold"),
                                           fg_color="#006400", hover_color="#004d00", state="disabled",
                                           command=lambda: self.execute_trajectory("eco"))
-        self.btn_eco_traj.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+        self.btn_eco_traj.grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
         step_title = ctk.CTkLabel(self.page_ik, text="Manevra Hamleleri", font=ctk.CTkFont(size=14, weight="bold"))
         step_title.pack(pady=(10, 5))
-        self.ik_steps_frame = ctk.CTkScrollableFrame(self.page_ik, fg_color="#242424", corner_radius=10, height=180)
-        self.ik_steps_frame.pack(fill="x", padx=10)
+        self.ik_steps_frame = ctk.CTkFrame(self.page_ik, fg_color="#242424", corner_radius=10)
+        self.ik_steps_frame.pack(fill="x", padx=10, pady=(0, 15))
+        self.make_scroll_smooth(self.page_ik, step_px=50)
 
-    # --- DİNAMİK LİMİT GÜNCELLEYİCİ ---
+    # --- ÇALIŞMA ALANI LİMİT VE CANLI ERİŞİM GÜNCELLEYİCİ ---
     def update_limits(self, *args):
         try:
-            x_val = float(self.var_x.get().strip().replace(',', '.'))
-        except:
-            x_val = 0.0
+            x_str = self.var_x.get().strip().replace(',', '.')
+            x_val = float(x_str) if x_str else None
+        except Exception:
+            x_val = None
 
         try:
-            y_val = float(self.var_y.get().strip().replace(',', '.'))
-        except:
-            y_val = 0.0
+            y_str = self.var_y.get().strip().replace(',', '.')
+            y_val = float(y_str) if y_str else None
+        except Exception:
+            y_val = None
 
-        max_r = float(getattr(self, 'robot_reach_cm', 70.0))  # Robotun gerçek ölçeğine göre dinamik uzanma (cm)
+        try:
+            z_str = self.var_z.get().strip().replace(',', '.')
+            z_val = float(z_str) if z_str else None
+        except Exception:
+            z_val = None
+
+        s_r = float(self.__dict__.get('shoulder_r_cm', 7.5))
+        s_z = float(self.__dict__.get('shoulder_z_cm', 33.0))
+        arm_len = float(self.__dict__.get('arm_length_cm', 72.8))
+        stand_top = float(self.__dict__.get('stand_top_cm', 0.0))
+        stand_half = float(self.__dict__.get('stand_half_extent_cm', 0.0))
+        max_r = float(self.__dict__.get('robot_reach_cm', s_r + arm_len))
+
+        min_floor = max(0.0, stand_top + (5.0 if stand_half > 0 else 0.0))
+        global_max_z = s_z + arm_len
+
+        # 1. X Sınırı: Sabit maksimum menzil
         if hasattr(self, 'lbl_limit_x'):
-            self.lbl_limit_x.configure(text=f"Sınır: ±{max_r:.1f}")
+            self.lbl_limit_x.configure(text=f"±{max_r:.0f} cm", text_color="gray")
 
-        if abs(x_val) >= max_r:
-            max_y = 0.0
-        else:
-            max_y = math.sqrt(max_r ** 2 - x_val ** 2)
+        # 2. Y Sınırı: X'e göre dinamik (X arttıkça izin verilen Y daralır)
         if hasattr(self, 'lbl_limit_y'):
-            self.lbl_limit_y.configure(text=f"Maks Y: ±{max_y:.1f}")
+            if x_val is not None:
+                if abs(x_val) > max_r:
+                    self.lbl_limit_y.configure(text="Menzil Dışı", text_color="#FF4444")
+                else:
+                    max_y = math.sqrt(max(0.0, max_r ** 2 - x_val ** 2))
+                    self.lbl_limit_y.configure(text=f"±{max_y:.0f} cm", text_color="gray")
+            else:
+                self.lbl_limit_y.configure(text=f"±{max_r:.0f} cm", text_color="gray")
 
-        term_z = max_r ** 2 - x_val ** 2 - y_val ** 2
-        if term_z <= 0:
-            max_z = 0.0
-        else:
-            max_z = math.sqrt(term_z)
+        # 3. Z Sınırı: X ve Y koordinatlarına göre dinamik (Yarıçap arttıkça dikey erişim küresi daralır)
         if hasattr(self, 'lbl_limit_z'):
-            self.lbl_limit_z.configure(text=f"Maks Z: ±{max_z:.1f}")
+            if x_val is not None or y_val is not None:
+                x_eval = x_val if x_val is not None else 0.0
+                y_eval = y_val if y_val is not None else 0.0
+                r_xy = math.sqrt(x_eval ** 2 + y_eval ** 2)
+
+                if r_xy > (max_r * 1.01):
+                    self.lbl_limit_z.configure(text="Menzil Dışı", text_color="#FF4444")
+                else:
+                    d_horiz = max(0.0, r_xy - s_r)
+                    if d_horiz > arm_len:
+                        self.lbl_limit_z.configure(text="Menzil Dışı", text_color="#FF4444")
+                    else:
+                        dz = math.sqrt(max(0.0, arm_len ** 2 - d_horiz ** 2))
+                        z_max = s_z + dz
+                        z_min = s_z - dz
+                        z_min_disp = max(min_floor, z_min)
+
+                        if z_min_disp > z_max:
+                            self.lbl_limit_z.configure(text="Menzil Dışı", text_color="#FF4444")
+                        else:
+                            self.lbl_limit_z.configure(text=f"{z_min_disp:.0f} - {z_max:.0f} cm", text_color="gray")
+            else:
+                self.lbl_limit_z.configure(text=f"{min_floor:.0f} - {global_max_z:.0f} cm", text_color="gray")
+
+        # 4. Canlı 3B Erişim Analizi (Kullanıcı koordinat yazdıkça rehberlik)
+        if hasattr(self, 'lbl_reach_status'):
+            if x_val is not None and y_val is not None and z_val is not None:
+                r_xy = math.sqrt(x_val ** 2 + y_val ** 2)
+                d_horiz = max(0.0, r_xy - s_r)
+                dist_3d = math.sqrt(d_horiz ** 2 + (z_val - s_z) ** 2)
+
+                is_below_floor = (stand_half > 0 and abs(x_val) <= stand_half + 5.0 and abs(y_val) <= stand_half + 5.0 and z_val < min_floor) or (z_val < 0.0)
+
+                if is_below_floor:
+                    self.lbl_reach_status.configure(
+                        text=f"⚠️ Hedef taban seviyesinin altında\nZ: {z_val:.0f} cm  (Min Güvenli: {min_floor:.0f} cm)",
+                        text_color="#FF5555"
+                    )
+                elif dist_3d <= arm_len:
+                    self.lbl_reach_status.configure(
+                        text=f"● Hedef erişilebilir\nMesafe: {dist_3d:.1f} cm  |  Sınır: {arm_len:.1f} cm",
+                        text_color="#00FFCC"
+                    )
+                else:
+                    diff = dist_3d - arm_len
+                    self.lbl_reach_status.configure(
+                        text=f"⚠️ Hedef erişim sınırı dışında\nMesafe: {dist_3d:.1f} cm  |  Aşım: +{diff:.1f} cm",
+                        text_color="#FFB300"
+                    )
+            elif x_val is not None or y_val is not None or z_val is not None:
+                self.lbl_reach_status.configure(
+                    text="● Hedef koordinatlarını tamamlayın\nX, Y ve Z değerlerini girin",
+                    text_color="#AAAAAA"
+                )
+            else:
+                self.lbl_reach_status.configure(
+                    text="● Hedef koordinatları girin\n3B uzanma analizi bekleniyor",
+                    text_color="gray"
+                )
+
+    def apply_payload_settings(self):
+        try:
+            val_p = self.entry_payload.get().strip().replace(',', '.')
+            self.payload_kg = max(0.0, float(val_p)) if val_p else 0.0
+        except Exception:
+            self.payload_kg = 0.0
+
+        try:
+            val_t = self.entry_tariff.get().strip().replace(',', '.')
+            self.electricity_rate = max(0.01, float(val_t)) if val_t else 4.50
+        except Exception:
+            self.electricity_rate = 4.50
+
+        try:
+            val_e = self.entry_efficiency.get().strip().replace(',', '.')
+            eff_pct = max(10.0, min(100.0, float(val_e))) if val_e else 85.0
+            self.motor_efficiency = eff_pct / 100.0
+        except Exception:
+            self.motor_efficiency = 0.85
+
+        with self.bullet_lock:
+            if hasattr(self, 'robotId') and self.robotId is not None and hasattr(self, 'end_effector_index'):
+                base_m = getattr(self, 'base_ee_mass', 1.0)
+                p.changeDynamics(self.robotId, self.end_effector_index, mass=base_m + self.payload_kg)
+
+        self.status_message = f"Yük Güncellendi: {self.payload_kg:.2f} kg | Verim: %{self.motor_efficiency*100:.0f} | Tarife: {self.electricity_rate:.2f} TL/kWh"
+
+    def reset_energy_counter(self):
+        self.cumulative_energy_joules = 0.0
+        self.cumulative_energy_kwh = 0.0
+        self.cumulative_cost_tl = 0.0
+        if hasattr(self, 'lbl_energy_summary'):
+            self.lbl_energy_summary.configure(text="Anlık: 0.0 W  |  Sayaç: 0.000 kWh  |  Maliyet: 0.00 TL")
+        self.status_message = "Enerji ve maliyet sayacı sıfırlandı."
 
     def show_page(self, page_name):
         self.page_manual.pack_forget()
@@ -726,16 +981,84 @@ class RobotKontrolApp(ctk.CTk):
 
         self.update_default_model_label()
 
-    def resolve_mesh_path(self, urdf_dir, mesh_filename):
+    def find_package_dir(self, pkg_name, context_path=None):
+        if not pkg_name:
+            return None
+        if not hasattr(self, 'known_packages'):
+            self.known_packages = {}
+
+        cache_key = (pkg_name.lower(), str(context_path))
+        if cache_key in self.known_packages:
+            return self.known_packages[cache_key]
+
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        sim_root = os.path.normpath(os.path.join(app_dir, ".."))
+        downloads_dir = os.path.expanduser("~/Downloads")
+
+        # 1. context_path hiyerarşisinde yukarı doğru ara (6 seviye)
+        if context_path and os.path.exists(context_path):
+            curr = os.path.abspath(context_path) if os.path.isdir(context_path) else os.path.dirname(os.path.abspath(context_path))
+            for _ in range(6):
+                if os.path.basename(curr).lower() == pkg_name.lower():
+                    self.known_packages[cache_key] = curr
+                    return curr
+                cand = os.path.join(curr, pkg_name)
+                if os.path.isdir(cand):
+                    self.known_packages[cache_key] = cand
+                    return cand
+                pkg_xml = os.path.join(curr, "package.xml")
+                if os.path.isfile(pkg_xml):
+                    try:
+                        with open(pkg_xml, 'r', encoding='utf-8', errors='ignore') as f:
+                            if f"<name>{pkg_name}</name>" in f.read():
+                                self.known_packages[cache_key] = curr
+                                return curr
+                    except Exception:
+                        pass
+                # Üst klasördeki kardeş klasörleri tara
+                parent = os.path.dirname(curr)
+                if os.path.isdir(parent):
+                    for entry in os.listdir(parent):
+                        cand_sib = os.path.join(parent, entry)
+                        if os.path.isdir(cand_sib) and entry.lower() == pkg_name.lower():
+                            self.known_packages[cache_key] = cand_sib
+                            return cand_sib
+                if parent == curr:
+                    break
+                curr = parent
+
+        # 2. Downloads, sim_root/resources ve sim_root kontrolü
+        for root_dir in [downloads_dir, os.path.join(sim_root, "resources"), sim_root]:
+            if not os.path.isdir(root_dir):
+                continue
+            cand = os.path.join(root_dir, pkg_name)
+            if os.path.isdir(cand):
+                self.known_packages[cache_key] = cand
+                return cand
+            try:
+                for entry in os.listdir(root_dir):
+                    sub = os.path.join(root_dir, entry)
+                    if os.path.isdir(sub):
+                        if entry.lower() == pkg_name.lower():
+                            self.known_packages[cache_key] = sub
+                            return sub
+                        cand_sub = os.path.join(sub, pkg_name)
+                        if os.path.isdir(cand_sub):
+                            self.known_packages[cache_key] = cand_sub
+                            return cand_sub
+            except Exception:
+                pass
+
+        self.known_packages[cache_key] = None
+        return None
+
+    def resolve_mesh_path(self, urdf_dir, mesh_filename, context_dir=None):
         if not mesh_filename:
             return None
         if isinstance(mesh_filename, bytes):
             mesh_filename = mesh_filename.decode('utf-8')
         if os.path.isabs(mesh_filename) and os.path.exists(mesh_filename):
             return os.path.abspath(mesh_filename).replace('\\', '/')
-
-        app_dir = os.path.dirname(os.path.abspath(__file__))
-        sim_root = os.path.normpath(os.path.join(app_dir, ".."))
 
         clean_path = mesh_filename
         pkg_name = ''
@@ -748,55 +1071,53 @@ class RobotKontrolApp(ctk.CTk):
                     clean_path = "/".join(parts[1:])
                 break
 
-        # 1. Simülatör dahili kaynak paketleri (resources/<pkg>/... veya resources/...)
+        # 1. Eğer paket adı tanımlıysa, ilgili paketin kökünü çöz ve SADECE bu paket içinde ara
         if pkg_name:
-            c1 = os.path.join(sim_root, "resources", pkg_name, clean_path)
-            if os.path.isfile(c1):
-                return os.path.abspath(c1).replace("\\", "/")
-            c2 = os.path.join(sim_root, "resources", clean_path)
-            if os.path.isfile(c2):
-                return os.path.abspath(c2).replace("\\", "/")
+            pkg_dir = self.find_package_dir(pkg_name, context_path=context_dir or urdf_dir)
+            if pkg_dir:
+                p_cand = os.path.normpath(os.path.join(pkg_dir, clean_path))
+                if os.path.isfile(p_cand):
+                    return os.path.abspath(p_cand).replace('\\', '/')
+                # Paket kökü altında dosya adına göre ara (Asla başka paketlerin parçalarını karıştırmaz!)
+                base_name = os.path.basename(clean_path)
+                for root, dirs, files in os.walk(pkg_dir):
+                    if base_name in files:
+                        return os.path.abspath(os.path.join(root, base_name)).replace('\\', '/')
 
-        # 2. Yerel dosya yolları (urdf_dir ve üst klasörleri)
-        candidate_dirs = [
-            urdf_dir,
-            os.path.normpath(os.path.join(urdf_dir, "..")),
-            os.path.normpath(os.path.join(urdf_dir, "meshes")),
-            os.path.normpath(os.path.join(urdf_dir, "..", "meshes")),
-            os.path.normpath(os.path.join(urdf_dir, "..", "..")),
-        ]
-        for cdir in candidate_dirs:
+        # 2. Yerel dosya yolları (context_dir ve urdf_dir hiyerarşisi)
+        search_dirs = []
+        if context_dir and os.path.isdir(context_dir):
+            search_dirs += [
+                context_dir,
+                os.path.normpath(os.path.join(context_dir, "..")),
+                os.path.normpath(os.path.join(context_dir, "meshes")),
+                os.path.normpath(os.path.join(context_dir, "..", "meshes")),
+                os.path.normpath(os.path.join(context_dir, "..", "..")),
+            ]
+        if urdf_dir and os.path.isdir(urdf_dir):
+            search_dirs += [
+                urdf_dir,
+                os.path.normpath(os.path.join(urdf_dir, "..")),
+                os.path.normpath(os.path.join(urdf_dir, "meshes")),
+                os.path.normpath(os.path.join(urdf_dir, "..", "meshes")),
+                os.path.normpath(os.path.join(urdf_dir, "..", "..")),
+            ]
+
+        for cdir in search_dirs:
             p_check = os.path.normpath(os.path.join(cdir, clean_path))
             if os.path.isfile(p_check):
-                return os.path.abspath(p_check).replace("\\", "/")
+                return os.path.abspath(p_check).replace('\\', '/')
 
-        # 3. Dosya adına göre tarama (resources, urdf_dir ve Downloads)
-        base_name = os.path.basename(mesh_filename)
-        if pkg_name:
-            pkg_res = os.path.join(sim_root, "resources", pkg_name)
-            if os.path.isdir(pkg_res):
-                for root, dirs, files in os.walk(pkg_res):
-                    if base_name in files:
-                        return os.path.abspath(os.path.join(root, base_name)).replace("\\", "/")
-
-        for root, dirs, files in os.walk(os.path.join(sim_root, "resources")):
-            if base_name in files:
-                return os.path.abspath(os.path.join(root, base_name)).replace("\\", "/")
-
-        for search_root in [os.path.dirname(urdf_dir), os.path.expanduser("~/Downloads")]:
-            if os.path.isdir(search_root):
-                try:
-                    for root, dirs, files in os.walk(search_root):
-                        if base_name in files:
-                            return os.path.abspath(os.path.join(root, base_name)).replace("\\", "/")
-                        if root[len(search_root):].count(os.sep) >= 4:
-                            dirs.clear()
-                except Exception:
-                    pass
+        # 3. Kendi kaynak klasöründe ara (Eğer paket adı belirtilmemişse)
+        if not pkg_name and context_dir and os.path.isdir(context_dir):
+            base_name = os.path.basename(mesh_filename)
+            for root, dirs, files in os.walk(context_dir):
+                if base_name in files:
+                    return os.path.abspath(os.path.join(root, base_name)).replace('\\', '/')
 
         return None
 
-    def sanitize_and_resolve_urdf(self, urdf_path):
+    def sanitize_and_resolve_urdf(self, urdf_path, context_dir=None):
         """
         PyBullet C++ URDF ayrıştırıcısının 'cannot find mesh' veya 'Error=XML_ERROR_PARSING_ATTRIBUTE'
         hatalarıyla çökmesini önler. Tüm mesh yollarını mutlak yola dönüştürür; bulunamayan mesh'ler
@@ -817,7 +1138,7 @@ class RobotKontrolApp(ctk.CTk):
                 mesh = geom.find("mesh")
                 if mesh is not None:
                     fn = mesh.attrib.get("filename", "")
-                    resolved = self.resolve_mesh_path(urdf_dir, fn)
+                    resolved = self.resolve_mesh_path(urdf_dir, fn, context_dir=context_dir)
                     if resolved and os.path.isfile(resolved):
                         mesh.attrib["filename"] = os.path.abspath(resolved).replace("\\", "/")
                     else:
@@ -838,7 +1159,7 @@ class RobotKontrolApp(ctk.CTk):
             print(f"[URDF Sanitize] Hata: {e}")
             return urdf_path
 
-    def load_robot_model(self, urdf_path, initial=False):
+    def load_robot_model(self, urdf_path, initial=False, context_dir=None):
         if not os.path.isfile(urdf_path):
             if not initial:
                 messagebox.showerror("Hata", f"Seçilen dosya bulunamadı:\n{urdf_path}")
@@ -849,9 +1170,11 @@ class RobotKontrolApp(ctk.CTk):
             app_dir = os.path.dirname(os.path.abspath(__file__))
             sim_root = os.path.normpath(os.path.join(app_dir, ".."))
             urdf_dir = os.path.dirname(os.path.abspath(urdf_path))
+            if not context_dir:
+                context_dir = getattr(self, 'current_source_dir', urdf_dir)
 
             # URDF'i PyBullet için sterilize et ve mesh yollarını bağla
-            sanitized_urdf = self.sanitize_and_resolve_urdf(urdf_path)
+            sanitized_urdf = self.sanitize_and_resolve_urdf(urdf_path, context_dir=context_dir)
 
             with self.bullet_lock:
                 if hasattr(self, 'robotId') and self.robotId is not None:
@@ -861,16 +1184,16 @@ class RobotKontrolApp(ctk.CTk):
                         pass
 
                 p.setAdditionalSearchPath(urdf_dir)
+                if context_dir and os.path.isdir(context_dir):
+                    p.setAdditionalSearchPath(context_dir)
                 p.setAdditionalSearchPath(os.path.normpath(os.path.join(urdf_dir, "..")))
                 p.setAdditionalSearchPath(os.path.join(sim_root, "resources"))
                 p.setAdditionalSearchPath(sim_root)
 
-                self_col_flags = p.URDF_USE_SELF_COLLISION | getattr(p, 'URDF_USE_SELF_COLLISION_EXCLUDE_PARENT', 16)
                 self.robotId = p.loadURDF(
                     sanitized_urdf,
                     [0, 0, 0],
                     p.getQuaternionFromEuler([0, 0, 0]),
-                    flags=self_col_flags,
                     useFixedBase=True
                 )
                 self.current_urdf_path = urdf_path
@@ -885,8 +1208,6 @@ class RobotKontrolApp(ctk.CTk):
                 if not self.revolute_joints:
                     self.revolute_joints = list(range(min(6, num_joints)))
 
-                self.end_effector_index = self.revolute_joints[-1] if self.revolute_joints else 0
-
                 self.link_joint_map = {}
                 self.link_names = {-1: "base_link"}
                 for ji in range(num_joints):
@@ -894,6 +1215,47 @@ class RobotKontrolApp(ctk.CTk):
                     child_link_name = info[12].decode('utf-8')
                     self.link_joint_map[child_link_name] = ji
                     self.link_names[ji] = child_link_name
+
+                # Kaide (Pedestal/Stand) ve Zemin geometrisi tespiti
+                stand_link_idx = None
+                for i in range(num_joints):
+                    name = p.getJointInfo(self.robotId, i)[12].decode('utf-8').lower()
+                    if any(s in name for s in ['stand', 'table', 'pedestal', 'sehp', 'kaide']):
+                        stand_link_idx = i
+                        break
+
+                self.stand_top_cm = 0.0
+                self.stand_half_extent_cm = 0.0
+                if stand_link_idx is not None:
+                    aabb_min, aabb_max = p.getAABB(self.robotId, stand_link_idx)
+                    self.stand_top_cm = max(0.0, aabb_max[2] * 100.0)
+                    self.stand_half_extent_cm = max(abs(aabb_max[0]), abs(aabb_max[1])) * 100.0
+                    self.min_safe_z_cm = self.stand_top_cm + 5.0
+                else:
+                    self.min_safe_z_cm = 5.0
+
+                first_revolute = self.revolute_joints[0] if self.revolute_joints else 0
+                shoulder_st = p.getLinkState(self.robotId, first_revolute)
+                self.base_z_cm = shoulder_st[4][2] * 100.0
+
+                # Akıllı Uç İşlevci (TCP / End-Effector) tespiti:
+                # Gripper parmak kızakları yerine asıl TCP/tool0 veya son revolute mafsalı seç
+                ee_candidates = []
+                for ji in range(num_joints):
+                    info = p.getJointInfo(self.robotId, ji)
+                    j_name = info[1].decode('utf-8').lower()
+                    c_name = info[12].decode('utf-8').lower()
+                    if any(k in c_name or k in j_name for k in ['tcp', 'tool0', 'ee_link', 'flange', 'end_effector']):
+                        ee_candidates.append(ji)
+
+                if ee_candidates:
+                    self.end_effector_index = ee_candidates[-1]
+                else:
+                    rev_only = [
+                        i for i in self.revolute_joints
+                        if p.getJointInfo(self.robotId, i)[2] in (p.JOINT_REVOLUTE, getattr(p, 'JOINT_CONTINUOUS', 0))
+                    ]
+                    self.end_effector_index = rev_only[-1] if rev_only else (self.revolute_joints[-1] if self.revolute_joints else 0)
 
                 # Eklem sınırları ve kinematik parametreleri (IK için)
                 self.joint_lower_limits = []
@@ -911,7 +1273,43 @@ class RobotKontrolApp(ctk.CTk):
                     self.joint_lower_limits.append(low)
                     self.joint_upper_limits.append(high)
                     self.joint_ranges.append(high - low)
-                    self.joint_rest_poses.append((low + high) / 2.0)
+                    # Doğal dirsek yukarı (elbow-up) duruşu tercih etmek için rest pose
+                    self.joint_rest_poses.append(0.0 if (low <= 0.0 <= high) else ((low + high) / 2.0))
+
+                    # Eklemlere dinamik sönümleme (damping) uygula - titreşimi ve boşta jiggle'ı önler
+                    try:
+                        p.changeDynamics(self.robotId, j_idx, linearDamping=0.2, angularDamping=0.2, jointDamping=0.5)
+                    except Exception:
+                        pass
+
+                # Başlangıç duruşundaki doğal temas ve bitişik eklem matrisi (Allowed Collision Matrix)
+                self.allowed_collision_pairs = set()
+                # 1. Bitişik kinematik ebeveyn-çocuk bağları daima izinlidir
+                for ji in range(num_joints):
+                    parent_idx = p.getJointInfo(self.robotId, ji)[16]
+                    if parent_idx >= -1:
+                        self.allowed_collision_pairs.add((min(parent_idx, ji), max(parent_idx, ji)))
+
+                # 2. Başlangıç duruşundaki temas eden diğer doğal parçalar
+                initial_contacts = p.getClosestPoints(self.robotId, self.robotId, distance=0.01)
+                for c in initial_contacts:
+                    lA, lB = c[3], c[4]
+                    if lA != lB:
+                        self.allowed_collision_pairs.add((min(lA, lB), max(lA, lB)))
+
+                # Uç işlevci orijinal kütlesini al ve tanımlı yükü uygula
+                try:
+                    dyn = p.getDynamicsInfo(self.robotId, self.end_effector_index)
+                    self.base_ee_mass = float(dyn[0]) if dyn else 1.0
+                except Exception:
+                    self.base_ee_mass = 1.0
+
+                current_payload = getattr(self, 'payload_kg', 0.0)
+                if current_payload > 0:
+                    try:
+                        p.changeDynamics(self.robotId, self.end_effector_index, mass=self.base_ee_mass + current_payload)
+                    except Exception:
+                        pass
 
                 # Görsel şekilleri ve geometrileri çıkar
                 try:
@@ -998,6 +1396,31 @@ class RobotKontrolApp(ctk.CTk):
                 auto_grid_size = max(1.5, float(max_span * 1.5))
                 self.robot_reach_cm = max(35.0, float(max(span_x, span_y, span_z * 0.8)) * 100.0)
 
+                # Kinematik omuz ve kol geometrisi
+                rev = self.revolute_joints
+                shoulder_idx = rev[1] if len(rev) > 1 else (rev[0] if rev else 0)
+                ls_shoulder = p.getLinkState(self.robotId, shoulder_idx)
+                s_pos = ls_shoulder[4]
+                self.shoulder_r_cm = math.sqrt(s_pos[0]**2 + s_pos[1]**2) * 100.0
+                self.shoulder_z_cm = s_pos[2] * 100.0
+                self.base_z_cm = self.shoulder_z_cm
+
+                # Omuzdan uç işlevciye kinematik zincir mesafesi
+                arm_len_m = 0.0
+                curr = getattr(self, 'end_effector_index', (rev[-1] if rev else 0))
+                visited = set()
+                while curr != shoulder_idx and curr >= 0 and curr not in visited:
+                    visited.add(curr)
+                    info = p.getJointInfo(self.robotId, curr)
+                    arm_len_m += math.sqrt(sum(x**2 for x in info[14]))
+                    curr = info[16]
+
+                if arm_len_m > 0.1:
+                    self.arm_length_cm = arm_len_m * 100.0 * 0.94
+                    self.robot_reach_cm = self.shoulder_r_cm + self.arm_length_cm
+                else:
+                    self.arm_length_cm = self.robot_reach_cm * 0.9
+
             n_joints = len(self.revolute_joints)
             with self.data_lock:
                 self.shared_targets = [0.0] * n_joints
@@ -1059,55 +1482,11 @@ class RobotKontrolApp(ctk.CTk):
             # ROS ortamı olmayan Windows sistemlerinde $(find ...) ve $(find-pkg-share ...)
             # paket çözümleme hatalarını önlemek için mock ament_index_python ve paket çözücü yapılandırılır
             def find_package_dir(pkg_name):
+                found = self.find_package_dir(pkg_name, context_path=xacro_path)
+                if found:
+                    return found
                 base_dir = os.path.dirname(os.path.abspath(xacro_path))
-                app_dir = os.path.dirname(os.path.abspath(__file__))
-                sim_root = os.path.normpath(os.path.join(app_dir, ".."))
-
-                # 1. Dahili simülatör kaynak paketleri ve İndirilenler klasörünü kontrol et
-                downloads_dir = os.path.expanduser("~/Downloads")
-                builtin_candidates = [
-                    os.path.join(sim_root, "resources", pkg_name),
-                    os.path.join(sim_root, pkg_name),
-                    os.path.join(downloads_dir, pkg_name),
-                ]
-                for bc in builtin_candidates:
-                    if os.path.isdir(bc):
-                        return bc
-
-                # İndirilenler klasörü altındaki açılmış paketleri tara
-                if os.path.isdir(downloads_dir):
-                    for entry in os.listdir(downloads_dir):
-                        full_p = os.path.join(downloads_dir, entry)
-                        if os.path.isdir(full_p):
-                            if entry.lower() == pkg_name.lower():
-                                return full_p
-                            sub_p = os.path.join(full_p, pkg_name)
-                            if os.path.isdir(sub_p):
-                                return sub_p
-
-                # 2. Klasör hiyerarşisinde yukarı doğru tara
-                search_dir = base_dir
-                for _ in range(6):
-                    if os.path.basename(search_dir).lower() == pkg_name.lower():
-                        return search_dir
-                    direct_child = os.path.join(search_dir, pkg_name)
-                    if os.path.isdir(direct_child):
-                        return direct_child
-                    parent = os.path.dirname(search_dir)
-                    if parent == search_dir:
-                        break
-                    search_dir = parent
-
-                # 3. Üst klasördeki kardeş paketleri tara
-                parent_dir = os.path.dirname(base_dir)
-                if os.path.isdir(parent_dir):
-                    for entry in os.listdir(parent_dir):
-                        p_full = os.path.join(parent_dir, entry)
-                        if os.path.isdir(p_full) and entry.lower() == pkg_name.lower():
-                            return p_full
-
-                # 4. Bulunamazsa xacro klasörünün bir üstünü (paket kökünü) döndür
-                return parent_dir if os.path.isdir(parent_dir) else base_dir
+                return os.path.dirname(base_dir) if os.path.isdir(os.path.dirname(base_dir)) else base_dir
 
             # Mock ament_index_python
             if "ament_index_python" not in sys.modules:
@@ -1217,6 +1596,8 @@ class RobotKontrolApp(ctk.CTk):
                 messagebox.showerror("Hata", f"Seçilen model dosyası bulunamadı:\n{file_path}")
             return False
 
+        self.current_source_dir = os.path.dirname(os.path.abspath(file_path))
+
         if file_path.lower().endswith(".xacro"):
             converted_urdf = self.convert_xacro_to_urdf(file_path)
             if not converted_urdf:
@@ -1225,7 +1606,7 @@ class RobotKontrolApp(ctk.CTk):
         else:
             urdf_path = file_path
 
-        success = self.load_robot_model(urdf_path, initial=initial)
+        success = self.load_robot_model(urdf_path, initial=initial, context_dir=self.current_source_dir)
         if success:
             self.current_source_path = os.path.abspath(file_path)
             # Son kullanılan modeller listesine ekle
@@ -1407,18 +1788,37 @@ class RobotKontrolApp(ctk.CTk):
                 for i, j_idx in enumerate(self.revolute_joints):
                     if i < len(angles):
                         p.resetJointState(self.robotId, j_idx, angles[i])
-                p.stepSimulation()
 
-                # 1. Kendisiyle çarpışma kontrolü (Self-Collision)
-                self_contacts = p.getContactPoints(self.robotId, self.robotId)
-                real_self = [c for c in self_contacts if c[8] < -0.002]
-                if real_self:
-                    c = real_self[0]
-                    linkA = getattr(self, 'link_names', {}).get(c[3], f"Link_{c[3]}")
-                    linkB = getattr(self, 'link_names', {}).get(c[4], f"Link_{c[4]}")
-                    return False, f"Gövde Çarpışması ({linkA} ↔ {linkB})"
+                # 1. Gövde & Kaide Çarpışma Kontrolü (Self / Base / Stand Collision)
+                if hasattr(self, 'allowed_collision_pairs'):
+                    contacts = p.getClosestPoints(self.robotId, self.robotId, distance=0.0)
+                    for c in contacts:
+                        lA, lB, dist = c[3], c[4], c[8]
+                        if lA == lB:
+                            continue
+                        pair = (min(lA, lB), max(lA, lB))
+                        if pair not in self.allowed_collision_pairs and dist < -0.012:
+                            nameA = getattr(self, 'link_names', {}).get(lA, f"Link_{lA}")
+                            nameB = getattr(self, 'link_names', {}).get(lB, f"Link_{lB}")
+                            return False, f"Gövde Çarpışması ({nameA} <-> {nameB})"
 
-                # 2. Engelle çarpışma kontrolü
+                # 2. Kaide (Stand) ve Zemin Penetrasyon Kontrolü
+                stand_half = getattr(self, 'stand_half_extent_cm', 0.0)
+                stand_top = getattr(self, 'stand_top_cm', 0.0)
+                for j_idx in self.revolute_joints:
+                    ls = p.getLinkState(self.robotId, j_idx)
+                    lx = ls[4][0] * 100.0
+                    ly = ls[4][1] * 100.0
+                    lz = ls[4][2] * 100.0
+                    if stand_half > 0 and abs(lx) <= stand_half and abs(ly) <= stand_half:
+                        if lz < stand_top:
+                            name = getattr(self, 'link_names', {}).get(j_idx, f"Link_{j_idx}")
+                            return False, f"Kaideye Çarpma ({name})"
+                    elif lz < 2.0:
+                        name = getattr(self, 'link_names', {}).get(j_idx, f"Link_{j_idx}")
+                        return False, f"Zemine Çarpma ({name})"
+
+                # 3. Harici Engelle çarpışma kontrolü
                 if self.obstacle_id is not None:
                     obs_contacts = p.getContactPoints(self.robotId, self.obstacle_id)
                     real_obs = [c for c in obs_contacts if c[8] < 0.0]
@@ -1431,29 +1831,45 @@ class RobotKontrolApp(ctk.CTk):
             finally:
                 for i, j_idx in enumerate(self.revolute_joints):
                     p.resetJointState(self.robotId, j_idx, original_states[i][0], original_states[i][1])
-                p.stepSimulation()
 
-    # --- TAM SORUNSUZ ÇALIŞAN (AŞIRTMA) ALGORİTMASI ---
+    # --- TAM SORUNSUZ ÇALIŞAN ÇOKLU-TOHUM VE GÜVENLİK KORUMALI IK ---
     def calculate_ik(self):
+        if hasattr(self, 'apply_payload_settings'):
+            self.apply_payload_settings()
+
         try:
             x_val = self.entry_x.get().strip().replace(',', '.')
             y_val = self.entry_y.get().strip().replace(',', '.')
             z_val = self.entry_z.get().strip().replace(',', '.')
 
-            x_cm = float(x_val) if x_val else 30.0
-            y_cm = float(y_val) if y_val else 0.0
-            z_cm = float(z_val) if z_val else 40.0
-            x_m, y_m, z_m = x_cm / 100.0, y_cm / 100.0, z_cm / 100.0
+            max_r = float(getattr(self, 'robot_reach_cm', 70.0))
+            stand_half = getattr(self, 'stand_half_extent_cm', 0.0)
+            stand_top = getattr(self, 'stand_top_cm', 0.0)
+            base_z = getattr(self, 'base_z_cm', 50.0)
 
-            self.pending_waypoints = []
+            x_cm = float(x_val) if x_val else (max_r * 0.45)
+            y_cm = float(y_val) if y_val else 0.0
+            z_cm = float(z_val) if z_val else (base_z + 15.0)
+
             math_log = "\n\n" + "=" * 52 + "\n"
             math_log += "=== TERS KİNEMATİK (IK) MATEMATİKSEL ÇÖZÜMÜ ===\n"
 
+            # Kaide ve Zemin Sınır Kontrolü
+            min_z_req = (stand_top + 5.0) if (stand_half > 0 and abs(x_cm) <= stand_half + 5.0 and abs(y_cm) <= stand_half + 5.0) else 0.0
+            if z_cm < min_z_req:
+                math_log += f">> [!] GÜVENLİK KORUMASI: Hedef Z ({z_cm:.1f} cm) zemin/kaide seviyesinin altında!\n"
+                math_log += f"    Z={min_z_req:.1f} cm güvenli yüksekliğe otomatik çekildi.\n\n"
+                z_cm = min_z_req
+                self.entry_z.delete(0, 'end')
+                self.entry_z.insert(0, f"{z_cm:.1f}")
+
+            x_m, y_m, z_m = x_cm / 100.0, y_cm / 100.0, z_cm / 100.0
+            self.pending_waypoints = []
             n_joints = len(self.revolute_joints)
 
             def solve_ik_pose(target_pos):
                 ik_kwargs = {
-                    'maxNumIterations': 500,
+                    'maxNumIterations': 400,
                     'residualThreshold': 1e-4
                 }
                 if hasattr(self, 'joint_lower_limits') and len(self.joint_lower_limits) == n_joints:
@@ -1462,67 +1878,155 @@ class RobotKontrolApp(ctk.CTk):
                     ik_kwargs['jointRanges'] = self.joint_ranges
                     ik_kwargs['restPoses'] = self.joint_rest_poses
 
-                sol = p.calculateInverseKinematics(
-                    self.robotId, self.end_effector_index, target_pos, **ik_kwargs
-                )
-                angles = list(sol[:n_joints])
-                # Sınır güvenlik kırpması (clamp)
-                if hasattr(self, 'joint_lower_limits') and len(self.joint_lower_limits) == n_joints:
-                    for k in range(n_joints):
-                        low = self.joint_lower_limits[k]
-                        high = self.joint_upper_limits[k]
-                        if low < high:
-                            angles[k] = max(low, min(high, angles[k]))
-                return angles
+                yaw_base = math.atan2(target_pos[1], target_pos[0]) if (target_pos[0] != 0 or target_pos[1] != 0) else 0.0
+
+                with self.data_lock:
+                    curr_targets = [self.shared_targets[i] for i in range(min(n_joints, len(self.shared_targets)))]
+
+                candidate_seeds = [
+                    curr_targets,
+                    [yaw_base, -0.4, 0.4] + [0.0] * max(0, n_joints - 3),
+                    [yaw_base, -0.7, 0.8] + [0.0] * max(0, n_joints - 3),
+                    [yaw_base, 0.0, 0.0] + [0.0] * max(0, n_joints - 3),
+                    [yaw_base, 0.3, -0.3] + [0.0] * max(0, n_joints - 3),
+                    [0.0] * n_joints
+                ]
+
+                best_angles = None
+                best_err = float('inf')
+                best_safe = False
+                best_desc = ""
+
+                orig = p.getJointStates(self.robotId, self.revolute_joints)
+                for seed in candidate_seeds:
+                    for i, j_idx in enumerate(self.revolute_joints):
+                        if i < len(seed):
+                            p.resetJointState(self.robotId, j_idx, seed[i])
+
+                    sol = p.calculateInverseKinematics(
+                        self.robotId, self.end_effector_index, target_pos, **ik_kwargs
+                    )
+                    angles = list(sol[:n_joints])
+                    if hasattr(self, 'joint_lower_limits') and len(self.joint_lower_limits) == n_joints:
+                        for k in range(n_joints):
+                            low = self.joint_lower_limits[k]
+                            high = self.joint_upper_limits[k]
+                            if low < high:
+                                angles[k] = max(low, min(high, angles[k]))
+
+                    for i, j_idx in enumerate(self.revolute_joints):
+                        p.resetJointState(self.robotId, j_idx, angles[i])
+                    ee_pos = p.getLinkState(self.robotId, self.end_effector_index)[4]
+                    err = math.sqrt(sum((a - b) ** 2 for a, b in zip(ee_pos, target_pos)))
+                    is_safe, desc = self.check_angles_safety(angles)
+
+                    if is_safe and err < 0.03:
+                        best_angles = angles
+                        best_err = err
+                        best_safe = True
+                        best_desc = desc
+                        break
+
+                    if not best_angles or (is_safe and not best_safe) or (is_safe == best_safe and err < best_err):
+                        best_angles = angles
+                        best_err = err
+                        best_safe = is_safe
+                        best_desc = desc
+
+                for i, j_idx in enumerate(self.revolute_joints):
+                    p.resetJointState(self.robotId, j_idx, orig[i][0], orig[i][1])
+
+                return best_angles, best_err, best_safe, best_desc
 
             with self.bullet_lock:
                 if self.obstacle_id is not None:
                     state = p.getLinkState(self.robotId, self.end_effector_index)
                     cx, cy, cz = state[4]
-
-                    # U-Rotası: Önce engelin veya mevcut konumun üzerine güvenli bir aşırtma noktası belirle
                     safe_z = max(cz, z_m, self.obstacle_pos[2] + 0.35)
 
-                    # Ara Nokta 1 (Sadece yukarı kalk)
-                    wp1 = solve_ik_pose([cx, cy, safe_z])
+                    wp1, err1, safe1, desc1 = solve_ik_pose([cx, cy, safe_z])
                     self.pending_waypoints.append(wp1)
 
-                    # Ara Nokta 2 (Hedefin üzerine süzül)
-                    wp2 = solve_ik_pose([x_m, y_m, safe_z])
+                    wp2, err2, safe2, desc2 = solve_ik_pose([x_m, y_m, safe_z])
                     self.pending_waypoints.append(wp2)
 
                     math_log += f">> OTONOM KAÇIŞ AKTİF: Engel Algılandı.\n"
                     math_log += f">> {safe_z * 100:.0f}cm irtifadan U-Dönüş rotası çizildi.\n\n"
 
-                # Nihai Hedefe İniş
-                final_angles = solve_ik_pose([x_m, y_m, z_m])
+                final_angles, final_err, final_safe, final_desc = solve_ik_pose([x_m, y_m, z_m])
                 self.pending_waypoints.append(final_angles)
 
-            current_angles = [var.get() for var in self.slider_vars]
-
+            current_angles = []
+            for var in self.slider_vars:
+                try:
+                    val = float(str(var.get()).replace(',', '.'))
+                except Exception:
+                    val = 0.0
+                current_angles.append(val)
             deg_diffs = [abs(math.degrees(self.pending_waypoints[-1][i] - current_angles[i])) for i in range(min(n_joints, len(current_angles)))]
             max_deg = max(deg_diffs) if deg_diffs else 0
 
-            self.time_fast = max(0.5, max_deg / 100.0)
-            if self.obstacle_id is not None: self.time_fast *= 1.5
+            # Yük ve motor dinamik süre & maliyet faktörleri
+            reach_cm = getattr(self, 'robot_reach_cm', 70.0)
+            rated_capacity = max(3.0, (reach_cm / 70.0) * 5.0)
+            payload = getattr(self, 'payload_kg', 0.0)
+            load_ratio = (payload / rated_capacity) if rated_capacity > 0 else 0.0
+            duration_factor = math.sqrt(1.0 + 1.2 * load_ratio + 0.5 * (load_ratio ** 2))
 
-            self.peak_power_fast = max_deg * 12.0 + 50.0
-            self.energy_fast = self.peak_power_fast * 0.6 * self.time_fast
+            time_base = max(0.5, max_deg / 100.0)
+            self.time_fast = time_base * duration_factor
+            if self.obstacle_id is not None: self.time_fast *= 1.5
             self.time_eco = self.time_fast * 1.8
-            self.peak_power_eco = self.peak_power_fast * 0.35
-            self.energy_eco = self.energy_fast * 0.45
+
+            eff = getattr(self, 'motor_efficiency', 0.85)
+            tariff = getattr(self, 'electricity_rate', 4.50)
+            standby_total_w = getattr(self, 'motor_standby_w', 15.0) * n_joints
+
+            load_power_mult = 1.0 + (0.75 * load_ratio)
+            self.peak_power_fast = (max_deg * 12.0 + 50.0) * load_power_mult
+            self.peak_power_eco = self.peak_power_fast * 0.38
+
+            # Hızlı Rota Enerji & Maliyet
+            p_avg_fast_elec = (self.peak_power_fast * 0.55 / eff) + standby_total_w
+            energy_fast_joules = p_avg_fast_elec * self.time_fast
+            cost_fast_kwh = energy_fast_joules / 3.6e6
+            cost_fast_tl = cost_fast_kwh * tariff
+
+            # Ekonomik Rota Enerji & Maliyet
+            p_avg_eco_elec = (self.peak_power_eco * 0.42 / eff) + standby_total_w
+            energy_eco_joules = p_avg_eco_elec * self.time_eco
+            cost_eco_kwh = energy_eco_joules / 3.6e6
+            cost_eco_tl = cost_eco_kwh * tariff
+
+            saving_pct = max(0.0, (1.0 - (cost_eco_tl / max(1e-6, cost_fast_tl))) * 100.0)
 
             math_log += f">> Adım 1: Hedef Uzay Vektörü (P_hedef)\n   P = [ {x_cm:.1f} cm, {y_cm:.1f} cm, {z_cm:.1f} cm ]^T\n\n"
-            math_log += f">> Adım 2: Jacobian Ters Matris & Açı Sınırları (Constrained IK)\n   Δθ = J^-1(θ) * ΔX (Eklem Sınır Koruması: Aktif)\n\n"
-            math_log += ">> Adım 3: DİNAMİK YÖRÜNGE VE ENERJİ ANALİZİ\n"
-            math_log += " [ Strateji 1: Hızlı (Trapezoidal) ]\n"
-            math_log += f"  - Tahmini Süre : {self.time_fast:.2f} sn\n"
-            math_log += f"  - Zirve Güç    : {self.peak_power_fast:.1f} W\n"
-            math_log += f"  - Enerji Yükü  : {self.energy_fast:.1f} J\n"
-            math_log += " [ Strateji 2: Ekonomik (S-Eğrisi) ]\n"
-            math_log += f"  - Tahmini Süre : {self.time_eco:.2f} sn\n"
-            math_log += f"  - Zirve Güç    : {self.peak_power_eco:.1f} W\n"
-            math_log += f"  - Enerji Yükü  : {self.energy_eco:.1f} J\n\n"
+            math_log += f">> Adım 2: Jacobian Ters Matris & Açı Sınırları (Constrained IK)\n   Δθ = J^-1(θ) * ΔX (Eklem Sınır Koruması: Aktif)\n"
+            if final_err <= 0.03:
+                math_log += f"   Hedef Doğrulama Sapması: {final_err * 100.0:.2f} cm (Mükemmel Hassasiyet)\n\n"
+            else:
+                math_log += f"   [!] Hedef Doğrulama Sapması: {final_err * 100.0:.2f} cm (Erişim sınırının dışında)\n\n"
+            math_log += ">> Adım 3: DİNAMİK YÖRÜNGE, MOTOR YÜKÜ VE ELEKTRİK MALİYETİ\n"
+            if payload <= 0.0:
+                math_log += f"  - Uç Yükü (Payload) : 0.0 kg (Yüksüz / Nominal motor hızı ve torku)\n"
+            else:
+                math_log += f"  - Uç Yükü (Payload) : {payload:.2f} kg (Kapasite: {rated_capacity:.1f} kg | Yük Oranı: %{load_ratio*100:.0f})\n"
+                if load_ratio > 1.0:
+                    math_log += f"  - [!] AŞIRI YÜK: Taşıma kapasitesi aşıldı! Güvenlik için hız/tork sınırlandırıldı.\n"
+                elif load_ratio > 0.05:
+                    math_log += f"  - Yük Süre Çarpanı  : {duration_factor:.2f}x (Tork/eylemsizlik koruması devrede)\n"
+            math_log += f"  - Motor Verimi      : %{eff*100:.0f} | Birim Elektrik: {tariff:.2f} TL/kWh | Bekleme: {standby_total_w:.0f}W\n\n"
+            math_log += " [ Strateji 1: Hızlı Rota (Trapezoidal) ]\n"
+            math_log += f"  • Tahmini Süre : {self.time_fast:.2f} sn\n"
+            math_log += f"  • Zirve Güç    : {self.peak_power_fast:.1f} W (Mekanik)\n"
+            math_log += f"  • Enerji Tüketimi : {cost_fast_kwh*1000:.3f} Wh ({energy_fast_joules:.1f} J)\n"
+            math_log += f"  • Tahmini Maliyet : {cost_fast_tl:.4f} TL\n\n"
+            math_log += " [ Strateji 2: Ekonomik Rota (S-Eğrisi) ]\n"
+            math_log += f"  • Tahmini Süre : {self.time_eco:.2f} sn\n"
+            math_log += f"  • Zirve Güç    : {self.peak_power_eco:.1f} W (Mekanik)\n"
+            math_log += f"  • Enerji Tüketimi : {cost_eco_kwh*1000:.3f} Wh ({energy_eco_joules:.1f} J)\n"
+            math_log += f"  • Tahmini Maliyet : {cost_eco_tl:.4f} TL\n"
+            math_log += f"  >> TASARRUF FARKI : Ekonomik rota ile %{saving_pct:.1f} daha az elektrik faturası!\n\n"
 
             # 4. Adım: Sanal Ön Çarpışma ve Güvenlik Testi (Pre-Flight Safety Check)
             math_log += ">> Adım 4: SANAL GÜVENLİK & ÇARPIŞMA ANALİZİ\n"
@@ -1540,27 +2044,44 @@ class RobotKontrolApp(ctk.CTk):
             math_log += "=" * 52 + "\n"
             self.ik_math_log = math_log
 
-            self.btn_fast_traj.configure(state="normal")
-            self.btn_eco_traj.configure(state="normal")
-
             # Hamle Butonlarını Oluştur
             for widget in self.ik_steps_frame.winfo_children(): widget.destroy()
 
             step_num = 1
             for wp in self.pending_waypoints:
-                btn = ctk.CTkButton(self.ik_steps_frame, text=f"Manevra {step_num} Konumuna Git", corner_radius=6,
-                                    command=lambda w=wp: self.go_to_ik_step(w), fg_color="#005A9E",
+                wp_safe, wp_desc = self.check_angles_safety(wp)
+                btn_state = "normal" if (wp_safe and final_err <= 0.03) else "disabled"
+                btn_color = "#005A9E" if btn_state == "normal" else "#555555"
+                btn_text = f"Manevra {step_num} Konumuna Git" if wp_safe else f"Manevra {step_num} (Kilitli: {wp_desc})"
+                btn = ctk.CTkButton(self.ik_steps_frame, text=btn_text, corner_radius=6,
+                                    command=lambda w=wp: self.go_to_ik_step(w),
+                                    state=btn_state,
+                                    fg_color=btn_color,
                                     hover_color="#003A68")
                 btn.pack(pady=5, padx=10, fill="x")
                 step_num += 1
 
-            if has_collision_risk:
-                self.status_message = f"UYARI: Hedefte {collision_warning_text} riski! (E-STOP tetiklenebilir)"
+            if has_collision_risk or final_err > 0.03:
+                self.btn_fast_traj.configure(state="disabled")
+                self.btn_eco_traj.configure(state="disabled")
+                fail_reason = collision_warning_text if has_collision_risk else f"Hedef Ulaşılamaz ({final_err * 100:.1f} cm sapma)"
+                self.status_message = f"UYARI: {fail_reason}! Hareket kilitlendi."
             else:
+                self.btn_fast_traj.configure(state="normal")
+                self.btn_eco_traj.configure(state="normal")
                 self.status_message = "IK Hesaplandı! Rota güvenli (Çarpışma yok). Yörünge seçin."
 
+            if hasattr(self, 'analysis_box'):
+                self._last_report_text = math_log
+                self.analysis_box.configure(state="normal")
+                self.analysis_box.delete("0.0", "end")
+                self.analysis_box.insert("end", math_log)
+                self.analysis_box.configure(state="disabled")
+
         except Exception as e:
-            self.status_message = f"HATA: {str(e)}"
+            import traceback
+            traceback.print_exc()
+            self.status_message = f"Hata: {str(e)}"
 
     def execute_trajectory(self, strategy):
         if self.e_stop_active:
@@ -1625,8 +2146,18 @@ class RobotKontrolApp(ctk.CTk):
         self.is_trajectory_playing = False
         if not self.e_stop_active:
             self.status_message = f"Robot hedefe başarıyla yerleşti!"
+        if hasattr(self, 'btn_fast_traj'):
+            self.btn_fast_traj.configure(state="normal")
+        if hasattr(self, 'btn_eco_traj'):
+            self.btn_eco_traj.configure(state="normal")
 
     def go_to_ik_step(self, angles):
+        is_safe, desc = self.check_angles_safety(angles)
+        if not is_safe:
+            messagebox.showwarning("Çarpışma Engeli", f"Bu konuma gidilemez:\n{desc}")
+            self.status_message = f"UYARI: {desc}! Hareket iptal edildi."
+            return
+
         with self.data_lock:
             for i in range(min(len(angles), len(self.slider_vars), len(self.shared_targets))):
                 self.slider_vars[i].set(angles[i])
@@ -1647,7 +2178,7 @@ class RobotKontrolApp(ctk.CTk):
 
         with self.data_lock:
             n_vars = len(self.slider_vars)
-            if getattr(self, "is_trajectory_playing", False):
+            if getattr(self, "is_trajectory_playing", False) or getattr(self, "e_stop_active", False):
                 for i in range(min(n_vars, len(self.shared_targets))):
                     self.slider_vars[i].set(self.shared_targets[i])
             else:
@@ -1679,17 +2210,28 @@ class RobotKontrolApp(ctk.CTk):
             except queue.Empty:
                 break
 
-        if tel:
-            final_text = tel
-            if self.current_page == "ik" and self.ik_math_log:
-                final_text += self.ik_math_log
-            elif self.current_page == "fk" and self.fk_math_log:
-                final_text += self.fk_math_log
+        if tel and hasattr(self, 'telemetry_box'):
+            if not hasattr(self, '_last_tel_text') or self._last_tel_text != tel:
+                self._last_tel_text = tel
+                self.telemetry_box.configure(state="normal")
+                self.telemetry_box.delete("0.0", "end")
+                self.telemetry_box.insert("end", tel)
+                self.telemetry_box.configure(state="disabled")
 
-            self.analysis_box.configure(state="normal")
-            self.analysis_box.delete("0.0", "end")
-            self.analysis_box.insert("end", final_text)
-            self.analysis_box.configure(state="disabled")
+        # Statik Matematik ve Güvenlik Raporu (Sadece yeni hesaplama yapıldığında güncellenir)
+        report_text = ""
+        if self.current_page == "ik" and getattr(self, 'ik_math_log', None):
+            report_text = self.ik_math_log
+        elif self.current_page == "fk" and getattr(self, 'fk_math_log', None):
+            report_text = self.fk_math_log
+
+        if hasattr(self, 'analysis_box') and report_text:
+            if not hasattr(self, '_last_report_text') or self._last_report_text != report_text:
+                self._last_report_text = report_text
+                self.analysis_box.configure(state="normal")
+                self.analysis_box.delete("0.0", "end")
+                self.analysis_box.insert("end", report_text)
+                self.analysis_box.configure(state="disabled")
 
         self.update_power_graph()
         self.after(30, self.update_ui_loop)
@@ -1699,14 +2241,23 @@ class RobotKontrolApp(ctk.CTk):
         if len(self.power_history) > 100:
             self.power_history.pop(0)
 
+        # Canlı sayaç ve maliyet etiketini güncelle
+        if hasattr(self, 'lbl_energy_summary'):
+            kwh_val = getattr(self, 'cumulative_energy_kwh', 0.0)
+            cost_val = getattr(self, 'cumulative_cost_tl', 0.0)
+            kwh_str = f"{kwh_val:.4f} kWh" if kwh_val < 1.0 else f"{kwh_val:.2f} kWh"
+            cost_str = f"{cost_val:.3f} TL" if cost_val < 10.0 else f"{cost_val:.2f} TL"
+            self.lbl_energy_summary.configure(
+                text=f"Anlık: {self.current_power:5.1f} W  |  Sayaç: {kwh_str}  |  Maliyet: {cost_str}"
+            )
+
         w = self.canvas.winfo_width()
         h = self.canvas.winfo_height()
         self.canvas.delete("all")
 
         self.canvas.create_line(0, h / 2, w, h / 2, fill="#333333", dash=(4, 4))
-        self.canvas.create_text(10, 10, text="Max W", fill="#555", anchor="nw")
-
         max_power_scale = max(200.0, max(self.power_history) * 1.2)
+        self.canvas.create_text(10, 10, text=f"Max: {max_power_scale:.0f} W", fill="#666666", anchor="nw")
         points = []
         for i, val in enumerate(self.power_history):
             x = (i / 100.0) * w
@@ -1725,10 +2276,11 @@ class RobotKontrolApp(ctk.CTk):
         accumulator = 0.0
         time_step = 1.0 / 240.0
 
-        last_time          = time.perf_counter()
-        last_tel_time      = last_time
-        last_swept_time    = last_time
+        last_time           = time.perf_counter()
+        last_tel_time       = last_time
+        last_swept_time     = last_time
         last_transform_time = last_time
+        last_safety_time    = last_time
 
         current_joints = [0.0] * len(self.revolute_joints)   # keeps last known joint positions for telemetry
 
@@ -1737,16 +2289,17 @@ class RobotKontrolApp(ctk.CTk):
             dt = current_time - last_time
             last_time = current_time
 
-            if dt > 0.1: dt = 0.1
+            if dt > 0.05: dt = 0.05
             accumulator += dt
 
             with self.data_lock:
                 targets = list(self.shared_targets)
 
-            with self.bullet_lock:
-                # ── Collision / E-STOP check ──────────────────────────────
-                if not self.e_stop_active:
-                    # 1. Engele çarpma kontrolü
+            # ── HAFİF VE HIZLI ÇARPIŞMA / GÜVENLİK KONTROLÜ (20 Hz) ────────
+            if not self.e_stop_active and (current_time - last_safety_time >= 0.05):
+                last_safety_time = current_time
+                with self.bullet_lock:
+                    # 1. Engele çarpma kontrolü (0.03 ms)
                     if self.obstacle_id is not None:
                         contacts = p.getContactPoints(self.robotId, self.obstacle_id)
                         real_obs = [c for c in contacts if c[8] < 0.0]
@@ -1755,48 +2308,80 @@ class RobotKontrolApp(ctk.CTk):
                             hit_idx = real_obs[0][3]
                             hit_name = getattr(self, 'link_names', {}).get(hit_idx, f"Link {hit_idx}")
                             self.status_message = f"E-STOP: ENGELE ÇARPTI! ({hit_name})"
-                            states = p.getJointStates(self.robotId, self.revolute_joints)
-                            for i in range(min(len(states), len(self.shared_targets))):
-                                self.shared_targets[i] = states[i][0]
 
-                    # 2. Kendisiyle çarpışma (Self-Collision) kontrolü
-                    if not self.e_stop_active:
-                        self_contacts = p.getContactPoints(self.robotId, self.robotId)
-                        real_self = [c for c in self_contacts if c[8] < -0.002]
-                        if real_self:
-                            self.e_stop_active = True
-                            c = real_self[0]
-                            linkA = getattr(self, 'link_names', {}).get(c[3], f"Link {c[3]}")
-                            linkB = getattr(self, 'link_names', {}).get(c[4], f"Link {c[4]}")
-                            self.status_message = f"E-STOP: GÖVDE ÇARPIŞMASI! ({linkA} ↔ {linkB})"
-                            states = p.getJointStates(self.robotId, self.revolute_joints)
-                            for i in range(min(len(states), len(self.shared_targets))):
-                                self.shared_targets[i] = states[i][0]
+                    # 2. Gövde içi çarpışma (Doğrudan C++ temas önbelleği - 0.03 ms)
+                    if not self.e_stop_active and hasattr(self, 'allowed_collision_pairs'):
+                        contacts = p.getContactPoints(self.robotId, self.robotId)
+                        for c in contacts:
+                            lA, lB, dist = c[3], c[4], c[8]
+                            if lA == lB or dist >= 0.0:
+                                continue
+                            pair = (min(lA, lB), max(lA, lB))
+                            if pair not in self.allowed_collision_pairs:
+                                self.e_stop_active = True
+                                nameA = getattr(self, 'link_names', {}).get(lA, f"Link {lA}")
+                                nameB = getattr(self, 'link_names', {}).get(lB, f"Link {lB}")
+                                self.status_message = f"E-STOP: GÖVDE ÇARPIŞMASI! ({nameA} <-> {nameB})"
+                                break
 
+                    # 3. Kaide ve Zemin koruması (Sadece hareket esnasında)
+                    if not self.e_stop_active and getattr(self, 'is_trajectory_playing', False):
+                        stand_half = getattr(self, 'stand_half_extent_cm', 0.0)
+                        stand_top = getattr(self, 'stand_top_cm', 0.0)
+                        for j_idx in self.revolute_joints:
+                            ls = p.getLinkState(self.robotId, j_idx)
+                            lx, ly, lz = ls[4][0] * 100.0, ls[4][1] * 100.0, ls[4][2] * 100.0
+                            if stand_half > 0 and abs(lx) <= stand_half and abs(ly) <= stand_half:
+                                if lz < stand_top - 0.5:
+                                    self.e_stop_active = True
+                                    name = getattr(self, 'link_names', {}).get(j_idx, f"Link {j_idx}")
+                                    self.status_message = f"E-STOP: KAİDEYE ÇARPTI! ({name})"
+                                    break
+                            elif lz < -1.0:
+                                self.e_stop_active = True
+                                name = getattr(self, 'link_names', {}).get(j_idx, f"Link {j_idx}")
+                                self.status_message = f"E-STOP: ZEMİNE ÇARPTI! ({name})"
+                                break
+
+            # ── FİZİK VE MOTOR KONTROLÜ ───────────────────────────────────────
+            with self.bullet_lock:
                 if self.e_stop_active:
                     states = p.getJointStates(self.robotId, self.revolute_joints)
                     for i in range(min(len(states), len(targets))):
                         targets[i] = states[i][0]
 
-                # ── Motor control ─────────────────────────────────────────
+                # Motor kontrol (Titreşim ve jiggle önleyici ayarlanmış P/V kazançları)
                 for i, joint_idx in enumerate(self.revolute_joints):
                     if i < len(targets):
                         p.setJointMotorControl2(
                             self.robotId, joint_idx, p.POSITION_CONTROL,
-                            targetPosition=targets[i], force=1500, maxVelocity=15.0
+                            targetPosition=targets[i], force=800, maxVelocity=4.0,
+                            positionGain=0.15, velocityGain=1.0
                         )
 
-                # ── Physics step at 240 Hz ────────────────────────────────
+                # Fizik adımı (Akümülatör spiral kilidini önleyici tavan: max 0.05s)
+                accumulator = min(accumulator, 0.05)
                 while accumulator >= time_step:
                     p.stepSimulation()
                     accumulator -= time_step
 
-                # ── Power estimation ──────────────────────────────────────
-                total_power = 0.0
+                # Güç & Enerji tahmini
+                total_mech = 0.0
                 joint_states = p.getJointStates(self.robotId, self.revolute_joints)
                 for js in joint_states:
-                    total_power += abs(js[1] * js[3])   # velocity × torque
-                self.current_power = (self.current_power * 0.8) + (total_power * 0.2 * 100)
+                    total_mech += abs(js[1] * js[3])   # velocity × torque
+
+                n_axes = len(self.revolute_joints)
+                eff = max(0.2, getattr(self, 'motor_efficiency', 0.85))
+                standby_p = getattr(self, 'motor_standby_w', 15.0) * n_axes
+
+                p_elec = (total_mech / eff) + standby_p
+                self.current_power = (self.current_power * 0.8) + (p_elec * 0.2)
+
+                self.cumulative_energy_joules += p_elec * dt
+                self.cumulative_energy_kwh = self.cumulative_energy_joules / 3.6e6
+                rate = getattr(self, 'electricity_rate', 4.50)
+                self.cumulative_cost_tl = self.cumulative_energy_kwh * rate
 
             # ── Swept volume (workspace trace) ────────────────────────────
             if self.show_workspace and (current_time - last_swept_time >= (1.0 / 15.0)):
@@ -1823,38 +2408,39 @@ class RobotKontrolApp(ctk.CTk):
                             w_pos, w_quat = p.multiplyTransforms(ls[4], ls[5], local_pos, local_ori)
                         transforms[idx] = quat_to_mat4(w_pos, w_quat)
 
-                    # also refresh current_joints for telemetry
                     js_all = p.getJointStates(self.robotId, self.revolute_joints)
                     current_joints = [js[0] for js in js_all]
 
                 with self.gpu_state_lock:
                     self.gpu_shared_state['transforms'] = transforms
 
-            # ── Telemetry at 10 Hz ────────────────────────────────────────
-            if current_time - last_tel_time >= 0.1:
+            # ── Telemetry at 5 Hz (Sabit, hafif telemetri akışı) ──────────
+            if current_time - last_tel_time >= 0.2:
                 last_tel_time = current_time
 
                 with self.bullet_lock:
                     state = p.getLinkState(self.robotId, self.end_effector_index)
                 pos, rpy = state[4], p.getEulerFromQuaternion(state[5])
 
-                model_name = os.path.splitext(os.path.basename(getattr(self, 'current_urdf_path', 'Fanuc LR-Mate')))[0]
-                log_text  = f"=== KONTROLCÜ DURUMU ({model_name}) ===\n"
-                log_text += f"STATUS       : {self.status_message}\n"
-                log_text += f"ACTIVE TOOL  : 1\n"
-                log_text += f"USER FRAME   : 0 (WORLD)\n\n"
-                log_text += "--- TCP KOORDİNATLARI (Cartesian) ---\n"
-                log_text += f"X : {pos[0] * 100:7.2f} cm    W (Roll) : {math.degrees(rpy[0]):7.2f}°\n"
-                log_text += f"Y : {pos[1] * 100:7.2f} cm    P (Pitch): {math.degrees(rpy[1]):7.2f}°\n"
-                log_text += f"Z : {pos[2] * 100:7.2f} cm    R (Yaw)  : {math.degrees(rpy[2]):7.2f}°\n\n"
-                log_text += f"--- EKLEM AÇILARI (Joints - {len(current_joints)} Eksen) ---\n"
-                for i, c_angle in enumerate(current_joints):
-                    log_text += f"J{i + 1} : {math.degrees(c_angle):7.2f}°\n"
+                model_name = os.path.splitext(os.path.basename(getattr(self, 'current_urdf_path', 'Robot')))[0]
+                for pfx in [".", "sanitized_", "compiled_"]:
+                    if model_name.startswith(pfx): model_name = model_name[len(pfx):]
+                if model_name.endswith("_generated"): model_name = model_name[:-10]
+
+                status_tag = "[KİLİTLENDİ]" if self.e_stop_active else "[NORMAL]"
+                j_deg = [f"{math.degrees(c):.1f}°" for c in current_joints[:6]]
+
+                log_text  = f"MODEL : {model_name}  {status_tag}\n"
+                log_text += f"TCP   : X={pos[0]*100:6.1f}cm  Y={pos[1]*100:6.1f}cm  Z={pos[2]*100:6.1f}cm\n"
+                log_text += f"DURUŞ : R={math.degrees(rpy[0]):5.1f}° P={math.degrees(rpy[1]):5.1f}° Y={math.degrees(rpy[2]):5.1f}°\n"
+                log_text += f"EKSEN : {' '.join(f'J{i+1}:{v}' for i, v in enumerate(j_deg))}\n"
+                if self.status_message:
+                    log_text += f">> {self.status_message}"
 
                 if not self.q_telemetry.full():
                     self.q_telemetry.put(log_text)
 
-            time.sleep(0.002)   # physics thread — rendering is done by GPU renderer
+            time.sleep(0.003)   # CPU dostu 200 Hz stabil fizik çevrimi
 
     def on_closing(self):
         self.is_running = False
