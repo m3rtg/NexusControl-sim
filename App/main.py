@@ -3,6 +3,7 @@ import pybullet_data
 import os
 import time
 import math
+import json
 import customtkinter as ctk
 from PIL import Image
 import numpy as np
@@ -169,17 +170,35 @@ class RobotKontrolApp(ctk.CTk):
         model_lbl = ctk.CTkLabel(self.sidebar, text="ROBOT MODELİ",
                                  font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
                                  text_color="#555555")
-        model_lbl.pack(pady=(10, 3))
+        model_lbl.pack(pady=(8, 3))
 
-        self.btn_load_urdf = ctk.CTkButton(self.sidebar, text="📁 Model Yükle (URDF / Xacro)", height=36, corner_radius=8,
+        self.btn_load_urdf = ctk.CTkButton(self.sidebar, text="📁 Model Yükle (URDF / Xacro)", height=34, corner_radius=8,
                                            fg_color="#1E4D2B", hover_color="#163820",
                                            command=self.open_urdf_file_dialog)
-        self.btn_load_urdf.pack(pady=4, padx=20, fill="x")
+        self.btn_load_urdf.pack(pady=3, padx=20, fill="x")
 
-        self.btn_reset_model = ctk.CTkButton(self.sidebar, text="↺ Varsayılan Fanuc", height=32, corner_radius=8,
+        # Varsayılan Yap & Fabrikaya Dön Butonları
+        btn_model_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        btn_model_frame.pack(pady=3, padx=20, fill="x")
+        btn_model_frame.grid_columnconfigure(0, weight=1)
+        btn_model_frame.grid_columnconfigure(1, weight=1)
+
+        self.btn_set_default = ctk.CTkButton(btn_model_frame, text="⭐ Ana Model Yap", height=30, corner_radius=8,
+                                             fg_color="#332B10", hover_color="#4A3E14", text_color="#FFD700",
+                                             font=ctk.CTkFont(size=11),
+                                             command=self.set_current_as_default)
+        self.btn_set_default.grid(row=0, column=0, padx=(0, 3), sticky="ew")
+
+        self.btn_reset_model = ctk.CTkButton(btn_model_frame, text="↺ Orijinal Fanuc", height=30, corner_radius=8,
                                              fg_color="#2A2A2A", hover_color="#3A3A3A",
+                                             font=ctk.CTkFont(size=11),
                                              command=self.reset_default_robot)
-        self.btn_reset_model.pack(pady=(2, 10), padx=20, fill="x")
+        self.btn_reset_model.grid(row=0, column=1, padx=(3, 0), sticky="ew")
+
+        self.lbl_default_info = ctk.CTkLabel(self.sidebar, text="Açılış: Fanuc (Dahili)",
+                                             font=ctk.CTkFont(family="Segoe UI", size=10),
+                                             text_color="#777777")
+        self.lbl_default_info.pack(pady=(1, 6))
 
         # --- 2. KONTROL PANELİ ---
         self.pages_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -625,6 +644,56 @@ class RobotKontrolApp(ctk.CTk):
             self.page_ik.pack(fill="both", expand=True)
 
     # ==========================================
+    # KONFİGÜRASYON VE HAFIZA SİSTEMİ
+    # ==========================================
+    def get_config_path(self):
+        return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
+
+    def load_config(self):
+        cfg_path = self.get_config_path()
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"default_model_path": None, "recent_models": []}
+
+    def save_config(self, cfg):
+        cfg_path = self.get_config_path()
+        try:
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=4, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"[Config] Kaydetme hatası: {e}")
+            return False
+
+    def get_model_name_from_path(self, path):
+        if not path:
+            return "Bilinmeyen Model"
+        base = os.path.splitext(os.path.basename(path))[0]
+        for pfx in [".", "sanitized_", "compiled_"]:
+            if base.startswith(pfx):
+                base = base[len(pfx):]
+        if base.endswith("_generated"):
+            base = base[:-10]
+        return base
+
+    def update_default_model_label(self):
+        if not hasattr(self, 'lbl_default_info'):
+            return
+        cfg = self.load_config()
+        saved_default = cfg.get("default_model_path")
+        if saved_default and os.path.isfile(saved_default):
+            name = self.get_model_name_from_path(saved_default)
+            if len(name) > 16:
+                name = name[:14] + ".."
+            self.lbl_default_info.configure(text=f"Açılış: {name} ⭐", text_color="#FFD700")
+        else:
+            self.lbl_default_info.configure(text="Açılış: Fanuc (Dahili)", text_color="#777777")
+
+    # ==========================================
     # KİNEMATİK VE PYBULLET SİSTEMİ
     # ==========================================
     def init_pybullet(self):
@@ -632,14 +701,30 @@ class RobotKontrolApp(ctk.CTk):
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, -9.81)
 
-        self.default_urdf_path = os.path.normpath(os.path.join(
+        self.builtin_urdf_path = os.path.normpath(os.path.join(
             os.path.dirname(__file__), "..", "fanuc_lrmate200ic_support", "urdf", "fanuc_lrmate200ic.urdf"
         ))
-        self.current_urdf_path = self.default_urdf_path
+        self.default_urdf_path = self.builtin_urdf_path
+        self.current_source_path = self.builtin_urdf_path
+        self.current_urdf_path = self.builtin_urdf_path
         self.visual_shapes_meta = []
         self.render_link_names = ['base_link', 'link_1', 'link_2', 'link_3', 'link_4', 'link_5', 'link_6']
 
-        self.load_robot_model(self.default_urdf_path, initial=True)
+        # Kayıtlı ana model kontrolü
+        loaded = False
+        cfg = self.load_config()
+        saved_default = cfg.get("default_model_path")
+        if saved_default and os.path.isfile(saved_default):
+            try:
+                loaded = self.load_source_model(saved_default, initial=True)
+            except Exception as e:
+                print(f"[Init] Kayıtlı ana model yüklenirken hata: {e}")
+                loaded = False
+
+        if not loaded:
+            self.load_source_model(self.builtin_urdf_path, initial=True)
+
+        self.update_default_model_label()
 
     def resolve_mesh_path(self, urdf_dir, mesh_filename):
         if not mesh_filename:
@@ -1104,6 +1189,37 @@ class RobotKontrolApp(ctk.CTk):
             self.status_message = f"HATA: Xacro bağımlılığı eksik"
             return None
 
+    def load_source_model(self, file_path, initial=False):
+        if not file_path or not os.path.isfile(file_path):
+            if not initial:
+                messagebox.showerror("Hata", f"Seçilen model dosyası bulunamadı:\n{file_path}")
+            return False
+
+        if file_path.lower().endswith(".xacro"):
+            converted_urdf = self.convert_xacro_to_urdf(file_path)
+            if not converted_urdf:
+                return False
+            urdf_path = converted_urdf
+        else:
+            urdf_path = file_path
+
+        success = self.load_robot_model(urdf_path, initial=initial)
+        if success:
+            self.current_source_path = os.path.abspath(file_path)
+            # Son kullanılan modeller listesine ekle
+            try:
+                cfg = self.load_config()
+                recents = cfg.get("recent_models", [])
+                norm_path = os.path.normpath(self.current_source_path)
+                if norm_path in recents:
+                    recents.remove(norm_path)
+                recents.insert(0, norm_path)
+                cfg["recent_models"] = recents[:5]
+                self.save_config(cfg)
+            except Exception:
+                pass
+        return success
+
     def open_urdf_file_dialog(self):
         file_path = filedialog.askopenfilename(
             title="Robot Modeli Seçin (URDF / Xacro)",
@@ -1117,18 +1233,73 @@ class RobotKontrolApp(ctk.CTk):
         if not file_path:
             return
 
-        if file_path.lower().endswith(".xacro"):
-            converted_urdf = self.convert_xacro_to_urdf(file_path)
-            if converted_urdf:
-                self.load_robot_model(converted_urdf)
+        success = self.load_source_model(file_path)
+        if success:
+            model_name = self.get_model_name_from_path(file_path)
+            self.status_message = f"Model Yüklendi: {model_name} (Açılış modeli yapmak için '⭐ Ana Model Yap'a basın)"
+
+    def set_current_as_default(self):
+        if not hasattr(self, 'current_source_path') or not self.current_source_path or not os.path.isfile(self.current_source_path):
+            messagebox.showwarning("Uyarı", "Şu anda yüklü geçerli bir robot modeli bulunamadı.")
+            return
+
+        cfg = self.load_config()
+        current_abs = os.path.abspath(self.current_source_path)
+        saved_abs = os.path.abspath(cfg.get("default_model_path")) if cfg.get("default_model_path") else None
+
+        # Zaten fabrika Fanuc modeli ise
+        is_builtin = hasattr(self, 'builtin_urdf_path') and os.path.normpath(current_abs) == os.path.normpath(os.path.abspath(self.builtin_urdf_path))
+        if is_builtin:
+            cfg["default_model_path"] = None
+            self.save_config(cfg)
+            self.update_default_model_label()
+            self.status_message = "Açılış modeli: Fabrika Fanuc LR-Mate"
+            messagebox.showinfo("Bilgi", "Fabrika modeli (Fanuc) varsayılan açılış modeli olarak ayarlandı.")
+            return
+
+        if saved_abs and os.path.normpath(current_abs) == os.path.normpath(saved_abs):
+            messagebox.showinfo("Bilgi", "Bu model zaten varsayılan açılış modeliniz olarak kayıtlı.")
+            return
+
+        cfg["default_model_path"] = current_abs
+        if self.save_config(cfg):
+            model_name = self.get_model_name_from_path(self.current_source_path)
+            self.update_default_model_label()
+            self.status_message = f"Ana Model Belirlendi: {model_name}"
+            messagebox.showinfo(
+                "Ana Model Kaydedildi",
+                f"'{model_name}' başarıyla ana model olarak kaydedildi!\n\n"
+                f"Uygulamayı her açtığınızda otomatik olarak bu model yüklenecektir."
+            )
         else:
-            self.load_robot_model(file_path)
+            messagebox.showerror("Hata", "Ayar dosyası kaydedilemedi.")
 
     def reset_default_robot(self):
-        if hasattr(self, 'default_urdf_path') and os.path.exists(self.default_urdf_path):
-            self.load_robot_model(self.default_urdf_path)
-        else:
+        target_path = getattr(self, 'builtin_urdf_path', getattr(self, 'default_urdf_path', None))
+        if not target_path or not os.path.exists(target_path):
             messagebox.showwarning("Uyarı", "Varsayılan Fanuc URDF dosyası bulunamadı.")
+            return
+
+        cfg = self.load_config()
+        has_custom_default = bool(cfg.get("default_model_path"))
+
+        success = self.load_source_model(target_path)
+        if success:
+            if has_custom_default:
+                ans = messagebox.askyesno(
+                    "Açılış Modelini Sıfırla",
+                    "Fabrika standardı Fanuc LR-Mate modeli yüklendi.\n\n"
+                    "Uygulamanın açılış varsayılanını da orijinal Fanuc olarak sıfırlamak ister misiniz?\n\n"
+                    "• EVET: Her açılışta Fanuc yüklenir (kayıtlı ana model temizlenir).\n"
+                    "• HAYIR: Sadece bu oturum için Fanuc kullanılır, kayıtlı ana modeliniz korunur."
+                )
+                if ans:
+                    cfg["default_model_path"] = None
+                    self.save_config(cfg)
+                    self.update_default_model_label()
+                    self.status_message = "Açılış modeli Fanuc olarak sıfırlandı."
+            else:
+                self.status_message = "Varsayılan Fanuc LR-Mate modeli yüklendi."
 
     def save_position(self):
         current_pos = [var.get() for var in self.slider_vars]
