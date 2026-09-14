@@ -865,10 +865,12 @@ class RobotKontrolApp(ctk.CTk):
                 p.setAdditionalSearchPath(os.path.join(sim_root, "resources"))
                 p.setAdditionalSearchPath(sim_root)
 
+                self_col_flags = p.URDF_USE_SELF_COLLISION | getattr(p, 'URDF_USE_SELF_COLLISION_EXCLUDE_PARENT', 16)
                 self.robotId = p.loadURDF(
                     sanitized_urdf,
                     [0, 0, 0],
                     p.getQuaternionFromEuler([0, 0, 0]),
+                    flags=self_col_flags,
                     useFixedBase=True
                 )
                 self.current_urdf_path = urdf_path
@@ -886,10 +888,30 @@ class RobotKontrolApp(ctk.CTk):
                 self.end_effector_index = self.revolute_joints[-1] if self.revolute_joints else 0
 
                 self.link_joint_map = {}
+                self.link_names = {-1: "base_link"}
                 for ji in range(num_joints):
                     info = p.getJointInfo(self.robotId, ji)
                     child_link_name = info[12].decode('utf-8')
                     self.link_joint_map[child_link_name] = ji
+                    self.link_names[ji] = child_link_name
+
+                # Eklem sınırları ve kinematik parametreleri (IK için)
+                self.joint_lower_limits = []
+                self.joint_upper_limits = []
+                self.joint_ranges = []
+                self.joint_rest_poses = []
+
+                for j_idx in self.revolute_joints:
+                    info = p.getJointInfo(self.robotId, j_idx)
+                    low = float(info[8])
+                    high = float(info[9])
+                    if low >= high:
+                        low = -math.pi
+                        high = math.pi
+                    self.joint_lower_limits.append(low)
+                    self.joint_upper_limits.append(high)
+                    self.joint_ranges.append(high - low)
+                    self.joint_rest_poses.append((low + high) / 2.0)
 
                 # Görsel şekilleri ve geometrileri çıkar
                 try:
@@ -1373,6 +1395,44 @@ class RobotKontrolApp(ctk.CTk):
         self.status_message = f"FK BAŞARILI: Matris Hesaplandı ve Loglandı."
         self.save_position()
 
+    def check_angles_safety(self, angles):
+        """
+        Sanal olarak verilen açıları robota geçici uygulayıp çarpışma olup olmadığını test eder.
+        Mevcut motor ve fizik durumunu bozmaz.
+        Dönüş: (is_safe: bool, collision_desc: str)
+        """
+        with self.bullet_lock:
+            original_states = p.getJointStates(self.robotId, self.revolute_joints)
+            try:
+                for i, j_idx in enumerate(self.revolute_joints):
+                    if i < len(angles):
+                        p.resetJointState(self.robotId, j_idx, angles[i])
+                p.stepSimulation()
+
+                # 1. Kendisiyle çarpışma kontrolü (Self-Collision)
+                self_contacts = p.getContactPoints(self.robotId, self.robotId)
+                real_self = [c for c in self_contacts if c[8] < -0.002]
+                if real_self:
+                    c = real_self[0]
+                    linkA = getattr(self, 'link_names', {}).get(c[3], f"Link_{c[3]}")
+                    linkB = getattr(self, 'link_names', {}).get(c[4], f"Link_{c[4]}")
+                    return False, f"Gövde Çarpışması ({linkA} ↔ {linkB})"
+
+                # 2. Engelle çarpışma kontrolü
+                if self.obstacle_id is not None:
+                    obs_contacts = p.getContactPoints(self.robotId, self.obstacle_id)
+                    real_obs = [c for c in obs_contacts if c[8] < 0.0]
+                    if real_obs:
+                        c = real_obs[0]
+                        link_hit = getattr(self, 'link_names', {}).get(c[3], f"Link_{c[3]}")
+                        return False, f"Engelle Çarpışma ({link_hit})"
+
+                return True, "Güvenli (Çarpışmasız)"
+            finally:
+                for i, j_idx in enumerate(self.revolute_joints):
+                    p.resetJointState(self.robotId, j_idx, original_states[i][0], original_states[i][1])
+                p.stepSimulation()
+
     # --- TAM SORUNSUZ ÇALIŞAN (AŞIRTMA) ALGORİTMASI ---
     def calculate_ik(self):
         try:
@@ -1386,10 +1446,35 @@ class RobotKontrolApp(ctk.CTk):
             x_m, y_m, z_m = x_cm / 100.0, y_cm / 100.0, z_cm / 100.0
 
             self.pending_waypoints = []
-            math_log = "\n\n" + "=" * 50 + "\n"
+            math_log = "\n\n" + "=" * 52 + "\n"
             math_log += "=== TERS KİNEMATİK (IK) MATEMATİKSEL ÇÖZÜMÜ ===\n"
 
             n_joints = len(self.revolute_joints)
+
+            def solve_ik_pose(target_pos):
+                ik_kwargs = {
+                    'maxNumIterations': 500,
+                    'residualThreshold': 1e-4
+                }
+                if hasattr(self, 'joint_lower_limits') and len(self.joint_lower_limits) == n_joints:
+                    ik_kwargs['lowerLimits'] = self.joint_lower_limits
+                    ik_kwargs['upperLimits'] = self.joint_upper_limits
+                    ik_kwargs['jointRanges'] = self.joint_ranges
+                    ik_kwargs['restPoses'] = self.joint_rest_poses
+
+                sol = p.calculateInverseKinematics(
+                    self.robotId, self.end_effector_index, target_pos, **ik_kwargs
+                )
+                angles = list(sol[:n_joints])
+                # Sınır güvenlik kırpması (clamp)
+                if hasattr(self, 'joint_lower_limits') and len(self.joint_lower_limits) == n_joints:
+                    for k in range(n_joints):
+                        low = self.joint_lower_limits[k]
+                        high = self.joint_upper_limits[k]
+                        if low < high:
+                            angles[k] = max(low, min(high, angles[k]))
+                return angles
+
             with self.bullet_lock:
                 if self.obstacle_id is not None:
                     state = p.getLinkState(self.robotId, self.end_effector_index)
@@ -1399,22 +1484,19 @@ class RobotKontrolApp(ctk.CTk):
                     safe_z = max(cz, z_m, self.obstacle_pos[2] + 0.35)
 
                     # Ara Nokta 1 (Sadece yukarı kalk)
-                    wp1 = p.calculateInverseKinematics(self.robotId, self.end_effector_index, [cx, cy, safe_z],
-                                                       maxNumIterations=500)
-                    self.pending_waypoints.append(list(wp1[:n_joints]))
+                    wp1 = solve_ik_pose([cx, cy, safe_z])
+                    self.pending_waypoints.append(wp1)
 
                     # Ara Nokta 2 (Hedefin üzerine süzül)
-                    wp2 = p.calculateInverseKinematics(self.robotId, self.end_effector_index, [x_m, y_m, safe_z],
-                                                       maxNumIterations=500)
-                    self.pending_waypoints.append(list(wp2[:n_joints]))
+                    wp2 = solve_ik_pose([x_m, y_m, safe_z])
+                    self.pending_waypoints.append(wp2)
 
                     math_log += f">> OTONOM KAÇIŞ AKTİF: Engel Algılandı.\n"
                     math_log += f">> {safe_z * 100:.0f}cm irtifadan U-Dönüş rotası çizildi.\n\n"
 
                 # Nihai Hedefe İniş
-                final_angles = p.calculateInverseKinematics(self.robotId, self.end_effector_index, [x_m, y_m, z_m],
-                                                            maxNumIterations=500)
-                self.pending_waypoints.append(list(final_angles[:n_joints]))
+                final_angles = solve_ik_pose([x_m, y_m, z_m])
+                self.pending_waypoints.append(final_angles)
 
             current_angles = [var.get() for var in self.slider_vars]
 
@@ -1431,7 +1513,7 @@ class RobotKontrolApp(ctk.CTk):
             self.energy_eco = self.energy_fast * 0.45
 
             math_log += f">> Adım 1: Hedef Uzay Vektörü (P_hedef)\n   P = [ {x_cm:.1f} cm, {y_cm:.1f} cm, {z_cm:.1f} cm ]^T\n\n"
-            math_log += f">> Adım 2: Jacobian Ters Matris Çözümü (J^-1)\n   Δθ = J^-1(θ) * ΔX\n\n"
+            math_log += f">> Adım 2: Jacobian Ters Matris & Açı Sınırları (Constrained IK)\n   Δθ = J^-1(θ) * ΔX (Eklem Sınır Koruması: Aktif)\n\n"
             math_log += ">> Adım 3: DİNAMİK YÖRÜNGE VE ENERJİ ANALİZİ\n"
             math_log += " [ Strateji 1: Hızlı (Trapezoidal) ]\n"
             math_log += f"  - Tahmini Süre : {self.time_fast:.2f} sn\n"
@@ -1440,9 +1522,22 @@ class RobotKontrolApp(ctk.CTk):
             math_log += " [ Strateji 2: Ekonomik (S-Eğrisi) ]\n"
             math_log += f"  - Tahmini Süre : {self.time_eco:.2f} sn\n"
             math_log += f"  - Zirve Güç    : {self.peak_power_eco:.1f} W\n"
-            math_log += f"  - Enerji Yükü  : {self.energy_eco:.1f} J\n"
-            math_log += "=" * 50 + "\n"
+            math_log += f"  - Enerji Yükü  : {self.energy_eco:.1f} J\n\n"
 
+            # 4. Adım: Sanal Ön Çarpışma ve Güvenlik Testi (Pre-Flight Safety Check)
+            math_log += ">> Adım 4: SANAL GÜVENLİK & ÇARPIŞMA ANALİZİ\n"
+            has_collision_risk = False
+            collision_warning_text = ""
+            for idx, wp in enumerate(self.pending_waypoints, 1):
+                is_safe, desc = self.check_angles_safety(wp)
+                if is_safe:
+                    math_log += f"  [✓] Manevra {idx}: Güvenli (Çarpışmasız rota)\n"
+                else:
+                    has_collision_risk = True
+                    collision_warning_text = desc
+                    math_log += f"  [!] UYARI Manevra {idx}: TEHLİKE -> {desc}!\n"
+
+            math_log += "=" * 52 + "\n"
             self.ik_math_log = math_log
 
             self.btn_fast_traj.configure(state="normal")
@@ -1459,7 +1554,10 @@ class RobotKontrolApp(ctk.CTk):
                 btn.pack(pady=5, padx=10, fill="x")
                 step_num += 1
 
-            self.status_message = "IK Hesaplandı! Lütfen hareket yörüngesi seçin."
+            if has_collision_risk:
+                self.status_message = f"UYARI: Hedefte {collision_warning_text} riski! (E-STOP tetiklenebilir)"
+            else:
+                self.status_message = "IK Hesaplandı! Rota güvenli (Çarpışma yok). Yörünge seçin."
 
         except Exception as e:
             self.status_message = f"HATA: {str(e)}"
@@ -1647,13 +1745,33 @@ class RobotKontrolApp(ctk.CTk):
 
             with self.bullet_lock:
                 # ── Collision / E-STOP check ──────────────────────────────
-                if self.obstacle_id is not None:
-                    contacts = p.getContactPoints(self.robotId, self.obstacle_id)
-                    if len(contacts) > 0 and not self.e_stop_active:
-                        self.e_stop_active = True
-                        states = p.getJointStates(self.robotId, self.revolute_joints)
-                        for i in range(min(len(states), len(self.shared_targets))):
-                            self.shared_targets[i] = states[i][0]
+                if not self.e_stop_active:
+                    # 1. Engele çarpma kontrolü
+                    if self.obstacle_id is not None:
+                        contacts = p.getContactPoints(self.robotId, self.obstacle_id)
+                        real_obs = [c for c in contacts if c[8] < 0.0]
+                        if real_obs:
+                            self.e_stop_active = True
+                            hit_idx = real_obs[0][3]
+                            hit_name = getattr(self, 'link_names', {}).get(hit_idx, f"Link {hit_idx}")
+                            self.status_message = f"E-STOP: ENGELE ÇARPTI! ({hit_name})"
+                            states = p.getJointStates(self.robotId, self.revolute_joints)
+                            for i in range(min(len(states), len(self.shared_targets))):
+                                self.shared_targets[i] = states[i][0]
+
+                    # 2. Kendisiyle çarpışma (Self-Collision) kontrolü
+                    if not self.e_stop_active:
+                        self_contacts = p.getContactPoints(self.robotId, self.robotId)
+                        real_self = [c for c in self_contacts if c[8] < -0.002]
+                        if real_self:
+                            self.e_stop_active = True
+                            c = real_self[0]
+                            linkA = getattr(self, 'link_names', {}).get(c[3], f"Link {c[3]}")
+                            linkB = getattr(self, 'link_names', {}).get(c[4], f"Link {c[4]}")
+                            self.status_message = f"E-STOP: GÖVDE ÇARPIŞMASI! ({linkA} ↔ {linkB})"
+                            states = p.getJointStates(self.robotId, self.revolute_joints)
+                            for i in range(min(len(states), len(self.shared_targets))):
+                                self.shared_targets[i] = states[i][0]
 
                 if self.e_stop_active:
                     states = p.getJointStates(self.robotId, self.revolute_joints)
