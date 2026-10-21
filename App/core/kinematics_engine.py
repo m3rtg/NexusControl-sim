@@ -41,6 +41,23 @@ class KinematicsEngine:
         self.peak_power_fast = 0.0
         self.peak_power_eco = 0.0
 
+    def prismatic_joint_flags(self):
+        """revolute_joints sırasıyla: eklem lineer (prismatic) ise True. Değeri metre, açı değil."""
+        with self.sim_engine.bullet_lock:
+            return [p.getJointInfo(self.sim_engine.robotId, j)[2] == p.JOINT_PRISMATIC
+                    for j in self.sim_engine.revolute_joints]
+
+    def ee_chain_joints(self):
+        """Uç işlevciden kaideye kadar zincirdeki eklemler. Zincir dışındaki eklemler
+        (ör. gripper parmakları) TCP konumunu etkilemez."""
+        chain = set()
+        with self.sim_engine.bullet_lock:
+            curr = getattr(self.sim_engine, 'end_effector_index', 0)
+            while curr >= 0 and curr not in chain:
+                chain.add(curr)
+                curr = p.getJointInfo(self.sim_engine.robotId, curr)[16]
+        return chain
+
     def calculate_fk(self):
         """Calculates Forward Kinematics and returns formatted log text."""
         with self.sim_engine.bullet_lock:
@@ -61,16 +78,20 @@ class KinematicsEngine:
         ]
 
         n_joints = len(self.sim_engine.revolute_joints)
+        prismatic = self.prismatic_joint_flags()
         fk_log = "\n\n" + "═" * 50 + "\n"
         fk_log += "   NİHAİ UÇ İŞLEVCİ (TCP) İLERİ KİNEMATİK RAPORU\n"
         fk_log += "═" * 50 + "\n\n"
         
         fk_log += "■ 1. MEVCUT EKLEM AÇILARI\n"
         fk_log += " ──────────────────────────────────────────\n"
-        fk_log += "  Eksen | Derece (°) | Radyan (rad)\n"
+        fk_log += "  Eksen | Derece (°) | Radyan (rad)\n" if not any(prismatic) else "  Eksen | Derece (°) / mm | Radyan (rad) / m\n"
         fk_log += " ──────────────────────────────────────────\n"
         for i, val in enumerate(current_joints):
-            fk_log += f"   J{i+1:<3} | {math.degrees(val):>8.2f}° | {val:>8.4f}\n"
+            if i < len(prismatic) and prismatic[i]:
+                fk_log += f"   J{i+1:<3} | {val * 1000:>8.2f} mm | {val:>8.4f} m\n"
+            else:
+                fk_log += f"   J{i+1:<3} | {math.degrees(val):>8.2f}° | {val:>8.4f}\n"
         fk_log += " ──────────────────────────────────────────\n\n"
 
         fk_log += "■ 2. UZAYDAKİ SON KONUM (X, Y, Z)\n"
@@ -156,6 +177,12 @@ class KinematicsEngine:
         x_m, y_m, z_m = x_cm / 100.0, y_cm / 100.0, z_cm / 100.0
         self.pending_waypoints = []
         n_joints = len(self.sim_engine.revolute_joints)
+        prismatic = self.prismatic_joint_flags()
+        ee_chain = self.ee_chain_joints()
+        # TCP'yi etkilemeyen eklemler (ör. gripper parmakları) IK'da mevcut değerinde kalır;
+        # aksi halde IK onları rest pozuna çeker ve tutulan parça düşebilir.
+        locked = [k for k, j_idx in enumerate(self.sim_engine.revolute_joints)
+                  if j_idx not in ee_chain and k < len(current_joint_angles)]
 
         def solve_ik_pose(target_pos):
             ik_kwargs = {
@@ -197,6 +224,8 @@ class KinematicsEngine:
                             high = self.joint_upper_limits[k]
                             if low < high:
                                 angles[k] = max(low, min(high, angles[k]))
+                    for k in locked:
+                        angles[k] = current_joint_angles[k]
 
                     for i, j_idx in enumerate(self.sim_engine.revolute_joints):
                         p.resetJointState(self.sim_engine.robotId, j_idx, angles[i])
@@ -241,7 +270,8 @@ class KinematicsEngine:
             final_angles, final_err, final_safe, final_desc = solve_ik_pose([x_m, y_m, z_m])
             self.pending_waypoints.append(final_angles)
 
-        deg_diffs = [abs(math.degrees(self.pending_waypoints[-1][i] - current_joint_angles[i])) for i in range(min(n_joints, len(current_joint_angles)))]
+        deg_diffs = [abs(math.degrees(self.pending_waypoints[-1][i] - current_joint_angles[i])) for i in range(min(n_joints, len(current_joint_angles)))
+                     if not (i < len(prismatic) and prismatic[i])]
         max_deg = max(deg_diffs) if deg_diffs else 0
 
         rated_capacity = max(3.0, (self.robot_reach_cm / 70.0) * 5.0)
