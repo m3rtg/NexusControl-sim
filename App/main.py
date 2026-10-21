@@ -1,4 +1,5 @@
 import os
+import gc
 import time
 import math
 import json
@@ -32,6 +33,12 @@ PHYSICS_DT = 1.0 / 240.0
 class RobotKontrolApp(ctk.CTk):
     def __init__(self):
         super().__init__()
+
+        # Otomatik GC kapalı, toplama update_ui_loop'ta (Tk thread'i) yapılır. Aksi halde GC, render ya da fizik
+        # thread'inde tetiklenip silinen Tk nesnelerinin (ör. IK'da yeniden kurulan butonların fontları)
+        # __del__'ini orada çalıştırıyor ve Tk thread-safe olmadığı için uygulama çöküyordu (segfault).
+        gc.disable()
+        self.gc_ticks = 0
 
         self.title("FANUC LR-Mate 200iC | NexusControl Studio (Modüler Mimari)")
         self.geometry("1450x920")
@@ -304,15 +311,20 @@ class RobotKontrolApp(ctk.CTk):
         self.trajectory_finished = True
 
     def go_to_ik_step(self, angles):
+        with self.data_lock:
+            current = list(self.shared_targets)
+
+        # Duruşun kendisi ve şu anki konumdan oraya giden yol (ör. doğrudan Manevra 3'e atlamak
+        # aradaki kaçış noktalarını atlar ve engelin içinden geçebilir)
         is_safe, desc = self.kinematics_engine.check_angles_safety(angles)
+        if is_safe:
+            is_safe, desc = self.kinematics_engine.check_path_safety(current, angles)
         if not is_safe:
             messagebox.showwarning("Çarpışma Engeli", f"Bu konuma gidilemez:\n{desc}")
             self.status_message = f"UYARI: {desc}! Hareket iptal edildi."
             return
 
         # Işınlamak yerine Eko rotanın S-eğrisiyle oraya gider; süre Eko rota tahminiyle aynı ölçekte
-        with self.data_lock:
-            current = list(self.shared_targets)
         prismatic = self.kinematics_engine.prismatic_joint_flags()
         max_deg = max([abs(math.degrees(a - c)) for a, c, lin in zip(angles, current, prismatic) if not lin] or [0.0])
         duration = max(0.5, max_deg / 100.0) * 1.8
@@ -537,6 +549,10 @@ class RobotKontrolApp(ctk.CTk):
 
     def update_ui_loop(self):
         if not self.is_running: return
+
+        # Nesil 0 her tick (~0.01 ms), nesil 1 her 10 tick, tam toplama ~30 sn'de bir (~14 ms)
+        self.gc_ticks += 1
+        gc.collect(2 if self.gc_ticks % 600 == 0 else 1 if self.gc_ticks % 10 == 0 else 0)
 
         with self.data_lock:
             n_vars = len(self.page_manual.slider_vars)
