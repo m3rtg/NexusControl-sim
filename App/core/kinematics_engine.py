@@ -59,6 +59,30 @@ class KinematicsEngine:
                 curr = p.getJointInfo(self.sim_engine.robotId, curr)[16]
         return chain
 
+    def detect_collision(self, check_floor):
+        """Gerçek temas kontrolü (E-stop için). Çarpışma varsa açıklama, yoksa None döner.
+        Kaide/zemin kontrolü sadece yörünge oynarken yapılır (refactor öncesi davranış)."""
+        with self.sim_engine.bullet_lock:
+            robot = self.sim_engine.robotId
+            if robot is None: return None
+
+            if self.sim_engine.obstacle_id is not None:
+                hits = [c for c in p.getContactPoints(robot, self.sim_engine.obstacle_id) if c[8] < 0.0]
+                if hits:
+                    return f"ENGELE ÇARPTI ({self.link_names.get(hits[0][3], f'Link {hits[0][3]}')})"
+
+            if check_floor:
+                for j_idx in self.sim_engine.revolute_joints:
+                    ls = p.getLinkState(robot, j_idx)
+                    lx, ly, lz = ls[4][0] * 100.0, ls[4][1] * 100.0, ls[4][2] * 100.0
+                    name = self.link_names.get(j_idx, f"Link {j_idx}")
+                    if self.stand_half_extent_cm > 0 and abs(lx) <= self.stand_half_extent_cm and abs(ly) <= self.stand_half_extent_cm:
+                        if lz < self.stand_top_cm - 0.5:
+                            return f"KAİDEYE ÇARPTI ({name})"
+                    elif lz < -1.0:
+                        return f"ZEMİNE ÇARPTI ({name})"
+        return None
+
     def calculate_fk(self):
         """Calculates Forward Kinematics and returns formatted log text."""
         with self.sim_engine.bullet_lock:
