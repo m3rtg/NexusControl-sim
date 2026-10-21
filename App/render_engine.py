@@ -275,8 +275,9 @@ class RobotGPURenderer:
                     if vao is None:
                         try:
                             if geom_type == 3:  # GEOM_BOX
-                                hx, hy, hz = dims[0], dims[1], dims[2]
-                                mesh_obj = trimesh.creation.box(extents=[max(0.01, hx * 2), max(0.01, hy * 2), max(0.01, hz * 2)])
+                                # getVisualShapeData kutu için tam boyut verir (yarı boyut değil); eskiden 2 ile
+                                # çarpılıyordu ve URDF'teki kutular (ör. robot_stand) iki kat büyük çiziliyordu
+                                mesh_obj = trimesh.creation.box(extents=[max(0.01, dims[0]), max(0.01, dims[1]), max(0.01, dims[2])])
                             elif geom_type == 4:  # GEOM_CYLINDER
                                 length, radius = dims[0], dims[1]
                                 mesh_obj = trimesh.creation.cylinder(radius=max(0.005, radius), height=max(0.01, length))

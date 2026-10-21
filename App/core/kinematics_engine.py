@@ -61,7 +61,8 @@ class KinematicsEngine:
 
     def detect_collision(self, check_floor):
         """Gerçek temas kontrolü (E-stop için). Çarpışma varsa açıklama, yoksa None döner.
-        Kaide/zemin kontrolü sadece yörünge oynarken yapılır (refactor öncesi davranış)."""
+        Engel ve gövde/kaide teması her zaman; kaide/zemin seviye kontrolü sadece yörünge oynarken
+        yapılır (refactor öncesi davranış)."""
         with self.sim_engine.bullet_lock:
             robot = self.sim_engine.robotId
             if robot is None: return None
@@ -70,6 +71,11 @@ class KinematicsEngine:
                 hits = [c for c in p.getContactPoints(robot, self.sim_engine.obstacle_id) if c[8] < 0.0]
                 if hits:
                     return f"ENGELE ÇARPTI ({self.link_names.get(hits[0][3], f'Link {hits[0][3]}')})"
+
+            for c in p.getContactPoints(robot, robot):
+                lA, lB = c[3], c[4]
+                if lA == lB or c[8] >= 0.0 or (min(lA, lB), max(lA, lB)) in self.allowed_collision_pairs: continue
+                return f"GÖVDE ÇARPIŞMASI ({self.link_names.get(lA, f'Link {lA}')} <-> {self.link_names.get(lB, f'Link {lB}')})"
 
             if check_floor:
                 for j_idx in self.sim_engine.revolute_joints:
@@ -284,7 +290,10 @@ class KinematicsEngine:
             if self.sim_engine.obstacle_id is not None:
                 state = p.getLinkState(self.sim_engine.robotId, getattr(self.sim_engine, 'end_effector_index', 0))
                 cx, cy, cz = state[4]
-                safe_z = max(cz, z_m, self.sim_engine.obstacle_pos[2] + 0.35)
+                # Engelin üstünden geç: tepe + 15 cm (model ölçeğinde). Eskiden merkez + 35 cm'di; uzun
+                # rastgele engellerde (tepe 80 cm) rota kutunun içinden geçiyordu.
+                obstacle_top = self.sim_engine.obstacle_pos[2] + self.sim_engine.obstacle_half[2]
+                safe_z = max(cz, z_m, obstacle_top + 0.15 * self.sim_engine.obstacle_scale)
 
                 wp1, err1, safe1, desc1 = solve_ik_pose([cx, cy, safe_z])
                 self.pending_waypoints.append(wp1)
