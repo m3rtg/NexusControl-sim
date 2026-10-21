@@ -3,13 +3,17 @@ import math
 import time
 import threading
 
+# İz segmentleri pybullet gövdesi değil, GPU renderer'a giden düz veridir.
+# Sınırsız büyümemesi için en eski segmentler atılır.
+MAX_TRAIL_SEGMENTS = 4000
+
 class KinematicsEngine:
     def __init__(self, sim_engine, telemetry_engine):
         self.sim_engine = sim_engine
         self.telemetry = telemetry_engine
         
         self.show_workspace = False
-        self.workspace_ids = []
+        self.trail_segments = []
         self.last_link_positions = {}
         
         # Kinematics specifics that are populated by Loader
@@ -37,6 +41,23 @@ class KinematicsEngine:
         self.peak_power_fast = 0.0
         self.peak_power_eco = 0.0
 
+    def prismatic_joint_flags(self):
+        """revolute_joints sırasıyla: eklem lineer (prismatic) ise True. Değeri metre, açı değil."""
+        with self.sim_engine.bullet_lock:
+            return [p.getJointInfo(self.sim_engine.robotId, j)[2] == p.JOINT_PRISMATIC
+                    for j in self.sim_engine.revolute_joints]
+
+    def ee_chain_joints(self):
+        """Uç işlevciden kaideye kadar zincirdeki eklemler. Zincir dışındaki eklemler
+        (ör. gripper parmakları) TCP konumunu etkilemez."""
+        chain = set()
+        with self.sim_engine.bullet_lock:
+            curr = getattr(self.sim_engine, 'end_effector_index', 0)
+            while curr >= 0 and curr not in chain:
+                chain.add(curr)
+                curr = p.getJointInfo(self.sim_engine.robotId, curr)[16]
+        return chain
+
     def calculate_fk(self):
         """Calculates Forward Kinematics and returns formatted log text."""
         with self.sim_engine.bullet_lock:
@@ -57,16 +78,20 @@ class KinematicsEngine:
         ]
 
         n_joints = len(self.sim_engine.revolute_joints)
+        prismatic = self.prismatic_joint_flags()
         fk_log = "\n\n" + "═" * 50 + "\n"
         fk_log += "   NİHAİ UÇ İŞLEVCİ (TCP) İLERİ KİNEMATİK RAPORU\n"
         fk_log += "═" * 50 + "\n\n"
         
         fk_log += "■ 1. MEVCUT EKLEM AÇILARI\n"
         fk_log += " ──────────────────────────────────────────\n"
-        fk_log += "  Eksen | Derece (°) | Radyan (rad)\n"
+        fk_log += "  Eksen | Derece (°) | Radyan (rad)\n" if not any(prismatic) else "  Eksen | Derece (°) / mm | Radyan (rad) / m\n"
         fk_log += " ──────────────────────────────────────────\n"
         for i, val in enumerate(current_joints):
-            fk_log += f"   J{i+1:<3} | {math.degrees(val):>8.2f}° | {val:>8.4f}\n"
+            if i < len(prismatic) and prismatic[i]:
+                fk_log += f"   J{i+1:<3} | {val * 1000:>8.2f} mm | {val:>8.4f} m\n"
+            else:
+                fk_log += f"   J{i+1:<3} | {math.degrees(val):>8.2f}° | {val:>8.4f}\n"
         fk_log += " ──────────────────────────────────────────\n\n"
 
         fk_log += "■ 2. UZAYDAKİ SON KONUM (X, Y, Z)\n"
@@ -152,6 +177,12 @@ class KinematicsEngine:
         x_m, y_m, z_m = x_cm / 100.0, y_cm / 100.0, z_cm / 100.0
         self.pending_waypoints = []
         n_joints = len(self.sim_engine.revolute_joints)
+        prismatic = self.prismatic_joint_flags()
+        ee_chain = self.ee_chain_joints()
+        # TCP'yi etkilemeyen eklemler (ör. gripper parmakları) IK'da mevcut değerinde kalır;
+        # aksi halde IK onları rest pozuna çeker ve tutulan parça düşebilir.
+        locked = [k for k, j_idx in enumerate(self.sim_engine.revolute_joints)
+                  if j_idx not in ee_chain and k < len(current_joint_angles)]
 
         def solve_ik_pose(target_pos):
             ik_kwargs = {
@@ -193,6 +224,8 @@ class KinematicsEngine:
                             high = self.joint_upper_limits[k]
                             if low < high:
                                 angles[k] = max(low, min(high, angles[k]))
+                    for k in locked:
+                        angles[k] = current_joint_angles[k]
 
                     for i, j_idx in enumerate(self.sim_engine.revolute_joints):
                         p.resetJointState(self.sim_engine.robotId, j_idx, angles[i])
@@ -237,7 +270,8 @@ class KinematicsEngine:
             final_angles, final_err, final_safe, final_desc = solve_ik_pose([x_m, y_m, z_m])
             self.pending_waypoints.append(final_angles)
 
-        deg_diffs = [abs(math.degrees(self.pending_waypoints[-1][i] - current_joint_angles[i])) for i in range(min(n_joints, len(current_joint_angles)))]
+        deg_diffs = [abs(math.degrees(self.pending_waypoints[-1][i] - current_joint_angles[i])) for i in range(min(n_joints, len(current_joint_angles)))
+                     if not (i < len(prismatic) and prismatic[i])]
         max_deg = max(deg_diffs) if deg_diffs else 0
 
         rated_capacity = max(3.0, (self.robot_reach_cm / 70.0) * 5.0)
@@ -309,13 +343,18 @@ class KinematicsEngine:
     def toggle_workspace(self):
         with self.sim_engine.bullet_lock:
             self.show_workspace = not self.show_workspace
-            if not self.show_workspace:
-                for wid in self.workspace_ids:
-                    p.removeBody(wid)
-                self.workspace_ids = []
-            else:
+            self.trail_segments = []
+            self.publish_trail()
+            if self.show_workspace:
                 self.update_link_positions()
         return self.show_workspace
+
+    def publish_trail(self):
+        gpu_state, gpu_lock = self.sim_engine.gpu_shared_state, self.sim_engine.gpu_state_lock
+        if gpu_state is None or gpu_lock is None: return
+        # Her değişimde yeni tuple: renderer değişikliği kimlikten anlar
+        with gpu_lock:
+            gpu_state['trail'] = tuple(self.trail_segments)
 
     def update_link_positions(self):
         with self.sim_engine.bullet_lock:
@@ -326,11 +365,11 @@ class KinematicsEngine:
 
     def draw_swept_volume(self):
         if not self.show_workspace: return
-        ghost_color = [0.0, 0.7, 1.0, 0.25]
-        
+        added = False
+
         with self.sim_engine.bullet_lock:
             if self.sim_engine.robotId is None or len(self.sim_engine.revolute_joints) < 2: return
-            
+
             for joint_idx in [self.sim_engine.revolute_joints[-2], self.sim_engine.revolute_joints[-1]]:
                 state = p.getLinkState(self.sim_engine.robotId, joint_idx)
                 current_pos = state[4]
@@ -348,10 +387,13 @@ class KinematicsEngine:
                     diff = [current_pos[0] - last_pos[0], current_pos[1] - last_pos[1], current_pos[2] - last_pos[2]]
                     pitch = -math.asin(diff[2] / dist) if dist != 0 else 0
                     yaw = math.atan2(diff[1], diff[0])
-                    ori = p.getQuaternionFromEuler([0, pitch, yaw])
+                    rot = p.getMatrixFromQuaternion(p.getQuaternionFromEuler([0, pitch, yaw]))
 
-                    v_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[dist / 2, 0.02, 0.01], rgbaColor=ghost_color)
-                    wid = p.createMultiBody(baseVisualShapeIndex=v_shape, basePosition=[mid_x, mid_y, mid_z],
-                                            baseOrientation=ori)
-                    self.workspace_ids.append(wid)
+                    # [merkez(3), rotasyon matrisi(9, satır öncelikli), yarı boyutlar(3)]
+                    self.trail_segments.append((mid_x, mid_y, mid_z, *rot, dist / 2, 0.02, 0.01))
                     self.last_link_positions[joint_idx] = current_pos
+                    added = True
+
+            if added:
+                del self.trail_segments[:-MAX_TRAIL_SEGMENTS]
+                self.publish_trail()
