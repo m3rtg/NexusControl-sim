@@ -70,7 +70,7 @@ class RobotKontrolApp(ctk.CTk):
         saved_default = cfg.get("default_model_path")
         loaded = False
         if saved_default and os.path.isfile(saved_default):
-            loaded, _, _ = self.robot_loader.load_robot_model(saved_default)
+            loaded, _, _ = self.robot_loader.load_source_model(saved_default)
         if not loaded:
             self.robot_loader.load_robot_model(self.builtin_urdf_path)
             
@@ -408,7 +408,7 @@ class RobotKontrolApp(ctk.CTk):
     def open_urdf_file_dialog(self):
         fp = filedialog.askopenfilename(filetypes=[("Modeller", "*.urdf;*.xacro")])
         if fp:
-            success, msg, data = self.robot_loader.load_robot_model(fp)
+            success, msg, data = self.robot_loader.load_source_model(fp)
             self.status_message = msg
             if success:
                 self.current_source_path = fp
