@@ -257,6 +257,20 @@ class RobotLoader:
         except Exception as e:
             return None, str(e)
 
+    def load_source_model(self, file_path):
+        if not file_path or not os.path.isfile(file_path):
+            return False, "Dosya bulunamadı", None
+
+        context_dir = os.path.dirname(os.path.abspath(file_path))
+        if file_path.lower().endswith(".xacro"):
+            urdf_path, err = self.convert_xacro_to_urdf(file_path)
+            if not urdf_path:
+                return False, f"Xacro Derleme hatası: {err}", None
+        else:
+            urdf_path = file_path
+
+        return self.load_robot_model(urdf_path, context_dir=context_dir)
+
     def load_robot_model(self, urdf_path, context_dir=None):
         if not os.path.isfile(urdf_path):
             return False, "Dosya bulunamadı", None
