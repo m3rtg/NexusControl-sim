@@ -60,10 +60,12 @@ class ManualPage(ctk.CTkFrame):
                 if low >= high or (abs(low) < 1e-5 and abs(high) < 1e-5):
                     low, high = -math.pi, math.pi
 
-                deg_low = math.degrees(low)
-                deg_high = math.degrees(high)
+                if info[2] == p.JOINT_PRISMATIC:
+                    range_text = f"{low * 1000:.0f} mm .. {high * 1000:.0f} mm"
+                else:
+                    range_text = f"{math.degrees(low):.0f}° .. {math.degrees(high):.0f}°"
 
-                lbl_text = f"Eksen J{i+1}: {raw_name} ({deg_low:.0f}° .. {deg_high:.0f}°)"
+                lbl_text = f"Eksen J{i+1}: {raw_name} ({range_text})"
                 label = ctk.CTkLabel(self.slider_card, text=lbl_text, font=ctk.CTkFont(size=12, weight="bold"))
                 label.pack(pady=(10, 0), padx=20, anchor="w")
 

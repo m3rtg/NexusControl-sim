@@ -80,8 +80,7 @@ class RobotKontrolApp(ctk.CTk):
             self.robot_loader.load_robot_model(self.builtin_urdf_path)
             
         self.update_default_model_label()
-        self.page_manual.rebuild_joint_sliders(self.sim_engine.revolute_joints, self.sim_engine.robotId, self.make_scroll_smooth)
-        self.page_ik.update_limits()
+        self.on_model_loaded()
         self.show_page("manual")
 
         mesh_dir = os.path.join(os.path.dirname(__file__), "..", "fanuc_lrmate200ic_support", "meshes", "lrmate200ic", "visual")
@@ -289,11 +288,9 @@ class RobotKontrolApp(ctk.CTk):
             if self.sim_engine.e_stop_active: break
             current = target_angles
 
-        self.save_position()
-        self.is_trajectory_playing = False
         if not self.sim_engine.e_stop_active: self.status_message = f"Robot hedefe başarıyla yerleşti!"
-        self.page_ik.btn_fast_traj.configure(state="normal")
-        self.page_ik.btn_eco_traj.configure(state="normal")
+        # Tk thread-safe değil: kayıt ve buton güncellemesi update_ui_loop'ta (ana thread) yapılır
+        self.trajectory_finished = True
 
     def go_to_ik_step(self, angles):
         is_safe, desc = self.kinematics_engine.check_angles_safety(angles)
@@ -326,6 +323,17 @@ class RobotKontrolApp(ctk.CTk):
         _bind_all_children(scrollable_frame)
         canvas = getattr(scrollable_frame, '_parent_canvas', None)
         if canvas: canvas.bind("<MouseWheel>", _on_wheel, add="+")
+
+    def on_model_loaded(self):
+        # Hedef listesi ve konum geçmişi modelin eksen sayısına göre yeniden boyutlanır;
+        # sabit 6 elemanlı liste 7. ve sonraki eksenlere (ör. gripper) komut gitmesini engelliyordu.
+        n_joints = len(self.sim_engine.revolute_joints)
+        with self.data_lock:
+            self.shared_targets = [0.0] * n_joints
+            self.position_history = [[0.0] * n_joints]
+            self.history_idx = 0
+        self.page_manual.rebuild_joint_sliders(self.sim_engine.revolute_joints, self.sim_engine.robotId, self.make_scroll_smooth)
+        self.page_ik.update_limits()
 
     def save_position(self):
         current_pos = [var.get() for var in self.page_manual.slider_vars]
@@ -417,8 +425,7 @@ class RobotKontrolApp(ctk.CTk):
             self.status_message = msg
             if success:
                 self.current_source_path = fp
-                self.page_manual.rebuild_joint_sliders(self.sim_engine.revolute_joints, self.sim_engine.robotId, self.make_scroll_smooth)
-                self.page_ik.update_limits()
+                self.on_model_loaded()
 
     def set_current_as_default(self):
         if not hasattr(self, 'current_source_path'): return
@@ -433,8 +440,7 @@ class RobotKontrolApp(ctk.CTk):
         self.save_config(cfg)
         self.robot_loader.load_robot_model(self.builtin_urdf_path)
         self.update_default_model_label()
-        self.page_manual.rebuild_joint_sliders(self.sim_engine.revolute_joints, self.sim_engine.robotId, self.make_scroll_smooth)
-        self.page_ik.update_limits()
+        self.on_model_loaded()
 
     # --- MAIN LOOPS ---
     def background_engine(self):
@@ -512,6 +518,14 @@ class RobotKontrolApp(ctk.CTk):
             else:
                 for i in range(min(n_vars, len(self.shared_targets))):
                     self.shared_targets[i] = self.page_manual.slider_vars[i].get()
+
+        # Slider'lar yukarıda son hedeflere eşitlendi; kayıt ondan sonra, oynatma bayrağı en son kapanır
+        if getattr(self, "trajectory_finished", False):
+            self.trajectory_finished = False
+            self.save_position()
+            self.is_trajectory_playing = False
+            self.page_ik.btn_fast_traj.configure(state="normal")
+            self.page_ik.btn_eco_traj.configure(state="normal")
 
         img = None
         while not self.q_img.empty():
