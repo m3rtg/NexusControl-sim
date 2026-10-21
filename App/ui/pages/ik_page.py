@@ -151,9 +151,12 @@ class IKPage(ctk.CTkScrollableFrame):
     def rebuild_waypoints(self, pending_waypoints, err, collision_risk, warning_text):
         for widget in self.ik_steps_frame.winfo_children(): widget.destroy()
 
+        safety = self.kinematics.pending_waypoint_safety
+        if len(safety) != len(pending_waypoints):
+            safety = [self.kinematics.check_angles_safety(wp) for wp in pending_waypoints]
+
         step_num = 1
-        for wp in pending_waypoints:
-            wp_safe, wp_desc = self.kinematics.check_angles_safety(wp)
+        for wp, (wp_safe, wp_desc) in zip(pending_waypoints, safety):
             btn_state = "normal" if (wp_safe and err <= 0.03) else "disabled"
             btn_color = "#005A9E" if btn_state == "normal" else "#555555"
             btn_text = f"Manevra {step_num} Konumuna Git" if wp_safe else f"Manevra {step_num} (Kilitli: {wp_desc})"

@@ -22,6 +22,7 @@ class AnalysisPanel(ctk.CTkFrame):
         self.analysis_box.pack(padx=12, pady=(0, 12), fill="both", expand=True)
         
         self._last_tel_text = ""
+        self._estop_state = None
         self._last_report_text = ""
         
     def update_telemetry(self, text):
@@ -41,6 +42,9 @@ class AnalysisPanel(ctk.CTkFrame):
             self.analysis_box.configure(state="disabled")
 
     def set_estop_state(self, is_active):
+        # Her UI tick'inde çağrılır; renk değişimi tüm paneli yeniden çizdiği için sadece durum değişince uygula
+        if is_active == self._estop_state: return
+        self._estop_state = is_active
         if is_active:
             self.configure(fg_color="#3A0000", border_color="#FF0000")
         else:
