@@ -3,13 +3,17 @@ import math
 import time
 import threading
 
+# İz segmentleri pybullet gövdesi değil, GPU renderer'a giden düz veridir.
+# Sınırsız büyümemesi için en eski segmentler atılır.
+MAX_TRAIL_SEGMENTS = 4000
+
 class KinematicsEngine:
     def __init__(self, sim_engine, telemetry_engine):
         self.sim_engine = sim_engine
         self.telemetry = telemetry_engine
         
         self.show_workspace = False
-        self.workspace_ids = []
+        self.trail_segments = []
         self.last_link_positions = {}
         
         # Kinematics specifics that are populated by Loader
@@ -309,13 +313,18 @@ class KinematicsEngine:
     def toggle_workspace(self):
         with self.sim_engine.bullet_lock:
             self.show_workspace = not self.show_workspace
-            if not self.show_workspace:
-                for wid in self.workspace_ids:
-                    p.removeBody(wid)
-                self.workspace_ids = []
-            else:
+            self.trail_segments = []
+            self.publish_trail()
+            if self.show_workspace:
                 self.update_link_positions()
         return self.show_workspace
+
+    def publish_trail(self):
+        gpu_state, gpu_lock = self.sim_engine.gpu_shared_state, self.sim_engine.gpu_state_lock
+        if gpu_state is None or gpu_lock is None: return
+        # Her değişimde yeni tuple: renderer değişikliği kimlikten anlar
+        with gpu_lock:
+            gpu_state['trail'] = tuple(self.trail_segments)
 
     def update_link_positions(self):
         with self.sim_engine.bullet_lock:
@@ -326,11 +335,11 @@ class KinematicsEngine:
 
     def draw_swept_volume(self):
         if not self.show_workspace: return
-        ghost_color = [0.0, 0.7, 1.0, 0.25]
-        
+        added = False
+
         with self.sim_engine.bullet_lock:
             if self.sim_engine.robotId is None or len(self.sim_engine.revolute_joints) < 2: return
-            
+
             for joint_idx in [self.sim_engine.revolute_joints[-2], self.sim_engine.revolute_joints[-1]]:
                 state = p.getLinkState(self.sim_engine.robotId, joint_idx)
                 current_pos = state[4]
@@ -348,10 +357,13 @@ class KinematicsEngine:
                     diff = [current_pos[0] - last_pos[0], current_pos[1] - last_pos[1], current_pos[2] - last_pos[2]]
                     pitch = -math.asin(diff[2] / dist) if dist != 0 else 0
                     yaw = math.atan2(diff[1], diff[0])
-                    ori = p.getQuaternionFromEuler([0, pitch, yaw])
+                    rot = p.getMatrixFromQuaternion(p.getQuaternionFromEuler([0, pitch, yaw]))
 
-                    v_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[dist / 2, 0.02, 0.01], rgbaColor=ghost_color)
-                    wid = p.createMultiBody(baseVisualShapeIndex=v_shape, basePosition=[mid_x, mid_y, mid_z],
-                                            baseOrientation=ori)
-                    self.workspace_ids.append(wid)
+                    # [merkez(3), rotasyon matrisi(9, satır öncelikli), yarı boyutlar(3)]
+                    self.trail_segments.append((mid_x, mid_y, mid_z, *rot, dist / 2, 0.02, 0.01))
                     self.last_link_positions[joint_idx] = current_pos
+                    added = True
+
+            if added:
+                del self.trail_segments[:-MAX_TRAIL_SEGMENTS]
+                self.publish_trail()

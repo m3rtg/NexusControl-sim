@@ -24,6 +24,11 @@ from render_engine import RobotGPURenderer
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+# Fizik, gerçek zamanın bu katı hızında ilerler. Robot slider'ı hızlı takip etsin diye 1'den büyük;
+# önceden bu oran makinenin döngü hızına bağlıydı (Linux'ta ~3.7x).
+SIM_SPEED = 4.0
+PHYSICS_DT = 1.0 / 240.0
+
 class RobotKontrolApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -121,9 +126,9 @@ class RobotKontrolApp(ctk.CTk):
         ctk.CTkButton(self.sidebar, text="E-STOP SIFIRLA", height=40, fg_color="#8B0000", command=self.reset_estop).pack(pady=(20, 8), padx=10, fill="x")
 
         # Kalite Seçici
-        self.quality_menu = ctk.CTkOptionMenu(self.sidebar, values=["Standard (640p)", "HD (1.5× SS)", "FHD (2× SS)"], command=self.set_render_quality)
+        self.quality_menu = ctk.CTkOptionMenu(self.sidebar, values=["Standard (600p)", "HD (1.5× SS)", "FHD (2× SS)"], command=self.set_render_quality)
         self.quality_menu.pack(pady=(18, 6), padx=10, fill="x")
-        self.lbl_qual_info = ctk.CTkLabel(self.sidebar, text="640p native · GPU · 60 FPS", font=ctk.CTkFont(size=10))
+        self.lbl_qual_info = ctk.CTkLabel(self.sidebar, text="600p native · GPU · 60 FPS", font=ctk.CTkFont(size=10))
         self.lbl_qual_info.pack(pady=(0, 6))
 
         # Model Yükleyici
@@ -376,10 +381,10 @@ class RobotKontrolApp(ctk.CTk):
             self.gpu_shared_state['cam_dist'] = max(0.3, min(40.0, dist * (1.12 ** (-event.delta / 120.0))))
 
     def set_render_quality(self, value):
-        preset_map = {"Standard (640p)": "standard", "HD (1.5× SS)": "hd", "FHD (2× SS)": "fhd"}
+        preset_map = {"Standard (600p)": "standard", "HD (1.5× SS)": "hd", "FHD (2× SS)": "fhd"}
         preset = preset_map.get(value, "standard")
         with self.gpu_state_lock: self.gpu_shared_state['preset'] = preset
-        self.lbl_qual_info.configure(text={"standard": "640p native · 60 FPS", "hd": "1.5× SS · 60 FPS", "fhd": "2× SS · 60 FPS"}[preset])
+        self.lbl_qual_info.configure(text={"standard": "600p native · 60 FPS", "hd": "1.5× SS · 60 FPS", "fhd": "2× SS · 60 FPS"}[preset])
 
     # --- URDF LOADING ---
     def load_config(self):
@@ -434,7 +439,6 @@ class RobotKontrolApp(ctk.CTk):
     # --- MAIN LOOPS ---
     def background_engine(self):
         accumulator = 0.0
-        time_step = 1.0 / 240.0
         last_time = time.perf_counter()
         last_swept_time = last_time
         last_transform_time = last_time
@@ -450,8 +454,12 @@ class RobotKontrolApp(ctk.CTk):
             # We decoupled check_angles_safety, but here we just step
             if not self.sim_engine.e_stop_active:
                 self.telemetry_engine.calculate_power_tick(dt)
-            
-            self.sim_engine.step_simulation(targets)
+
+            # Sabit adımlı fizik: duvar saatinde geçen süre x SIM_SPEED kadar simülasyon
+            accumulator += dt * SIM_SPEED
+            while accumulator >= PHYSICS_DT:
+                self.sim_engine.step_simulation(targets)
+                accumulator -= PHYSICS_DT
 
             if self.kinematics_engine.show_workspace and (current_time - last_swept_time >= (1.0 / 15.0)):
                 last_swept_time = current_time
@@ -477,11 +485,21 @@ class RobotKontrolApp(ctk.CTk):
                                 tf_mat[:3, 3] = lp_pos
                                 transforms[idx] = tf_mat
                             except: pass
+                # Robot durduysa yayınlama: renderer sadece sahne değişince kare üretir.
+                # Model yüklenince loader listeyi sıfırlar, o yüzden paylaşılan değerle karşılaştır.
                 with self.gpu_state_lock:
-                    self.gpu_shared_state['transforms'] = transforms
-                    self.gpu_shared_state['running'] = self.is_running
+                    if not self._transforms_equal(transforms, self.gpu_shared_state.get('transforms')):
+                        self.gpu_shared_state['transforms'] = transforms
 
-            time.sleep(0.001)
+            time.sleep(max(0.0, PHYSICS_DT - (time.perf_counter() - current_time)))
+
+    @staticmethod
+    def _transforms_equal(a, b):
+        if a is None or b is None or len(a) != len(b): return False
+        for ta, tb in zip(a, b):
+            if (ta is None) != (tb is None): return False
+            if ta is not None and not np.allclose(ta, tb, atol=1e-6): return False
+        return True
 
     def update_ui_loop(self):
         if not self.is_running: return

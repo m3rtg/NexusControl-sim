@@ -28,6 +28,7 @@ uniform vec3  u_color;
 uniform vec3  u_light_pos;
 uniform vec3  u_view_pos;
 uniform float u_ambient;
+uniform float u_alpha;
 out vec4 out_color;
 void main() {
     vec3 N = normalize(v_norm);
@@ -37,7 +38,7 @@ void main() {
     float diff = max(dot(N, L), 0.0);
     float spec = pow(max(dot(N, H), 0.0), 64.0);
     vec3 col = (u_ambient + diff * 0.72 + spec * 0.28) * u_color;
-    out_color = vec4(col, 1.0);
+    out_color = vec4(col, u_alpha);
 }
 '''
 
@@ -117,6 +118,17 @@ def _axis_verts():
                      0,0,0.005,0,0.8,0, 0,L,0.005,0,0.8,0,
                      0,0,0.005,0,0.4,1, 0,0,L,0,0.4,1],dtype=np.float32)
 
+def _trail_verts(segments):
+    # segment: [merkez(3), rotasyon(9, satır öncelikli), yarı boyutlar(3)]
+    seg=np.asarray(segments,dtype=np.float32)
+    box=trimesh.creation.box(extents=(2.0,2.0,2.0))
+    tri=box.triangles.reshape(-1,3).astype(np.float32)
+    nrm=np.repeat(box.face_normals,3,axis=0).astype(np.float32)
+    rot=seg[:,3:12].reshape(-1,3,3)
+    pos=np.einsum('nij,nkj->nki',rot,tri[None]*seg[:,None,12:15])+seg[:,None,0:3]
+    nor=np.einsum('nij,kj->nki',rot,nrm)
+    return np.concatenate([pos,nor],axis=2).reshape(-1,6).astype(np.float32)
+
 def _box_verts(hx,hy,hz):
     data=[]
     faces=[([[ hx,-hy,-hz],[ hx, hy,-hz],[ hx, hy, hz],[ hx,-hy, hz]],[1,0,0]),
@@ -134,9 +146,10 @@ LINK_NAMES=['base_link','link_1','link_2','link_3','link_4','link_5','link_6']
 LINK_COLORS={'base_link':(0.22,0.22,0.22),'link_1':(0.96,0.76,0.13),'link_2':(0.96,0.76,0.13),
              'link_3':(0.96,0.76,0.13),'link_4':(0.96,0.76,0.13),'link_5':(0.15,0.15,0.15),
              'link_6':(0.22,0.22,0.22)}
-PRESETS={'standard':{'render':(640,800),'display':(600,800)},
-         'hd':{'render':(960,1200),'display':(600,800)},
-         'fhd':{'render':(1280,1600),'display':(600,800)}}
+PRESETS={'standard':{'render':(600,800),'display':(600,800)},
+         'hd':{'render':(900,1200),'display':(600,800)},
+         'fhd':{'render':(1200,1600),'display':(600,800)}}
+TRAIL_COLOR=(0.0,0.7,1.0); TRAIL_ALPHA=0.25
 
 class RobotGPURenderer:
     def __init__(self,mesh_dir,q_img,shared_state,state_lock):
@@ -167,7 +180,7 @@ class RobotGPURenderer:
         glfw.window_hint(glfw.CONTEXT_VERSION_MINOR,3)
         glfw.window_hint(glfw.OPENGL_PROFILE,glfw.OPENGL_CORE_PROFILE)
         glfw.window_hint(glfw.DOUBLEBUFFER,glfw.FALSE)
-        win=glfw.create_window(640,800,'offscreen',None,None)
+        win=glfw.create_window(600,800,'offscreen',None,None)
         if not win: glfw.terminate(); print('[GPURender] window failed'); return
         glfw.make_context_current(win)
         ctx=moderngl.create_context()
@@ -191,7 +204,10 @@ class RobotGPURenderer:
         axis_vao = ctx.vertex_array(axis_prog, [(ctx.buffer(_axis_verts().tobytes()), '3f 3f', 'in_pos', 'in_col')])
 
         box_vao = None; box_vbo = None; box_key = None
-        cur_rw, cur_rh = 640, 800
+        trail_vao = None; trail_vbo = None; built_trail = ()
+        # Sadece sahne değişince render al: son çizilen durumun referansları
+        last_transforms = None; last_trail = None; last_view = None; force_render = True
+        cur_rw, cur_rh = 600, 800
         fbo = self._make_fbo(ctx, cur_rw, cur_rh)
         cam_yaw, cam_pitch, cam_dist = 45.0, -25.0, 1.8
         cam_target = np.array([0., 0., 0.45])
@@ -203,6 +219,7 @@ class RobotGPURenderer:
                 if not self.shared.get('running', True): break
                 transforms = self.shared.get('transforms', [None] * len(current_link_names))
                 obstacle = self.shared.get('obstacle', None)
+                trail = self.shared.get('trail', ())
                 preset = self.shared.get('preset', 'standard')
 
                 cam_dist = float(self.shared.get('cam_dist', cam_dist))
@@ -226,6 +243,7 @@ class RobotGPURenderer:
 
             # Dinamik model yükleme talebi geldiğinde VAO'ları güncelle
             if new_mesh_data is not None:
+                force_render = True
                 for vao_item in robot_vaos.values():
                     try:
                         if isinstance(vao_item, tuple): vao_item[0].release()
@@ -285,54 +303,75 @@ class RobotGPURenderer:
                     if vao is not None:
                         robot_vaos[name] = (vao, col)
 
-            cfg = PRESETS.get(preset, PRESETS['standard'])
-            rw, rh = cfg['render']; dw, dh = cfg['display']
-            if rw != cur_rw or rh != cur_rh:
-                fbo.release(); cur_rw, cur_rh = rw, rh; fbo = self._make_fbo(ctx, cur_rw, cur_rh)
-            eye = _eye_pos(cam_target, cam_yaw, cam_pitch, cam_dist)
-            view = _look_at(eye, cam_target)
-            proj = _perspective(60.0, cur_rw / cur_rh, 0.01, max(100.0, cam_dist * 10.0))
-            view_b = view.T.astype(np.float32).tobytes()
-            proj_b = proj.T.astype(np.float32).tobytes()
-            fbo.use(); ctx.viewport = (0, 0, cur_rw, cur_rh); ctx.clear(0.098, 0.098, 0.098, 1.0)
-            prog['u_view'].write(view_b); prog['u_proj'].write(proj_b)
-            prog['u_light_pos'].value = (cam_dist * 0.8, cam_dist * 0.6, cam_dist * 1.5)
-            prog['u_view_pos'].value = tuple(float(e) for e in eye)
-            prog['u_ambient'].value = 0.35
-            for i, name in enumerate(current_link_names):
-                T = (transforms[i] if (transforms and i < len(transforms) and transforms[i] is not None) else np.eye(4, dtype=np.float32))
-                prog['u_model'].write(T.T.astype(np.float32).tobytes())
-                if name in robot_vaos:
-                    vao_entry = robot_vaos[name]
-                    if isinstance(vao_entry, tuple):
-                        vao, col = vao_entry
-                        prog['u_color'].value = col
-                        vao.render()
-                    else:
-                        prog['u_color'].value = LINK_COLORS.get(name, (0.8, 0.8, 0.8))
-                        vao_entry.render()
-            if obstacle is not None:
-                obs_pos,half=obstacle
-                key=(round(half[0],4),round(half[1],4),round(half[2],4))
-                if key!=box_key:
-                    if box_vao is not None: box_vao.release(); box_vbo.release()
-                    bv=_box_verts(*half); box_vbo=ctx.buffer(bv.tobytes())
-                    box_vao=ctx.vertex_array(prog,[(box_vbo,'3f 3f','in_position','in_normal')]); box_key=key
-                T_box=np.eye(4,dtype=np.float32); T_box[0,3]=obs_pos[0]; T_box[1,3]=obs_pos[1]; T_box[2,3]=obs_pos[2]
-                prog['u_model'].write(T_box.T.astype(np.float32).tobytes())
-                prog['u_color'].value=(0.85,0.14,0.04); box_vao.render()
-            ctx.enable(moderngl.BLEND); ctx.blend_func=moderngl.SRC_ALPHA,moderngl.ONE_MINUS_SRC_ALPHA
-            grid_prog['u_view'].write(view_b); grid_prog['u_proj'].write(proj_b)
-            grid_vao.render(moderngl.LINES)
-            axis_prog['u_view'].write(view_b); axis_prog['u_proj'].write(proj_b)
-            axis_vao.render(moderngl.LINES)
-            ctx.disable(moderngl.BLEND)
-            raw=fbo.read(components=3)
-            img=Image.frombytes('RGB',(cur_rw,cur_rh),raw).transpose(Image.FLIP_TOP_BOTTOM)
-            if (cur_rw,cur_rh)!=(dw,dh):
-                try: img=img.resize((dw,dh),Image.Resampling.LANCZOS)
-                except: img=img.resize((dw,dh),Image.LANCZOS)
-            if not self.q_img.full(): self.q_img.put(img)
+            if trail is not built_trail:
+                if trail_vao is not None: trail_vao.release(); trail_vbo.release(); trail_vao = None
+                if trail:
+                    trail_vbo = ctx.buffer(_trail_verts(trail).tobytes())
+                    trail_vao = ctx.vertex_array(prog, [(trail_vbo, '3f 3f', 'in_position', 'in_normal')])
+                built_trail = trail
+
+            # UI son kareyi almadıysa (kuyruk dolu) bekle; kare kaybolmaz, sadece ertelenir
+            view_state = (cam_dist, tuple(cam_target.tolist()), cam_yaw, cam_pitch, preset, cur_grid_size, obstacle)
+            scene_changed = (force_render or transforms is not last_transforms or trail is not last_trail
+                             or view_state != last_view)
+            if scene_changed and not self.q_img.full():
+                cfg = PRESETS.get(preset, PRESETS['standard'])
+                rw, rh = cfg['render']; dw, dh = cfg['display']
+                if rw != cur_rw or rh != cur_rh:
+                    fbo.release(); cur_rw, cur_rh = rw, rh; fbo = self._make_fbo(ctx, cur_rw, cur_rh)
+                eye = _eye_pos(cam_target, cam_yaw, cam_pitch, cam_dist)
+                view = _look_at(eye, cam_target)
+                proj = _perspective(60.0, cur_rw / cur_rh, 0.01, max(100.0, cam_dist * 10.0))
+                view_b = view.T.astype(np.float32).tobytes()
+                proj_b = proj.T.astype(np.float32).tobytes()
+                fbo.use(); ctx.viewport = (0, 0, cur_rw, cur_rh); ctx.clear(0.098, 0.098, 0.098, 1.0)
+                prog['u_view'].write(view_b); prog['u_proj'].write(proj_b)
+                prog['u_light_pos'].value = (cam_dist * 0.8, cam_dist * 0.6, cam_dist * 1.5)
+                prog['u_view_pos'].value = tuple(float(e) for e in eye)
+                prog['u_ambient'].value = 0.35
+                prog['u_alpha'].value = 1.0
+                for i, name in enumerate(current_link_names):
+                    T = (transforms[i] if (transforms and i < len(transforms) and transforms[i] is not None) else np.eye(4, dtype=np.float32))
+                    prog['u_model'].write(T.T.astype(np.float32).tobytes())
+                    if name in robot_vaos:
+                        vao_entry = robot_vaos[name]
+                        if isinstance(vao_entry, tuple):
+                            vao, col = vao_entry
+                            prog['u_color'].value = col
+                            vao.render()
+                        else:
+                            prog['u_color'].value = LINK_COLORS.get(name, (0.8, 0.8, 0.8))
+                            vao_entry.render()
+                if obstacle is not None:
+                    obs_pos,half=obstacle
+                    key=(round(half[0],4),round(half[1],4),round(half[2],4))
+                    if key!=box_key:
+                        if box_vao is not None: box_vao.release(); box_vbo.release()
+                        bv=_box_verts(*half); box_vbo=ctx.buffer(bv.tobytes())
+                        box_vao=ctx.vertex_array(prog,[(box_vbo,'3f 3f','in_position','in_normal')]); box_key=key
+                    T_box=np.eye(4,dtype=np.float32); T_box[0,3]=obs_pos[0]; T_box[1,3]=obs_pos[1]; T_box[2,3]=obs_pos[2]
+                    prog['u_model'].write(T_box.T.astype(np.float32).tobytes())
+                    prog['u_color'].value=(0.85,0.14,0.04); box_vao.render()
+                ctx.enable(moderngl.BLEND); ctx.blend_func=moderngl.SRC_ALPHA,moderngl.ONE_MINUS_SRC_ALPHA
+                if trail_vao is not None:
+                    fbo.depth_mask=False
+                    prog['u_model'].write(np.eye(4,dtype=np.float32).tobytes())
+                    prog['u_color'].value=TRAIL_COLOR; prog['u_alpha'].value=TRAIL_ALPHA
+                    trail_vao.render()
+                    prog['u_alpha'].value=1.0
+                    fbo.depth_mask=True
+                grid_prog['u_view'].write(view_b); grid_prog['u_proj'].write(proj_b)
+                grid_vao.render(moderngl.LINES)
+                axis_prog['u_view'].write(view_b); axis_prog['u_proj'].write(proj_b)
+                axis_vao.render(moderngl.LINES)
+                ctx.disable(moderngl.BLEND)
+                raw=fbo.read(components=3)
+                img=Image.frombytes('RGB',(cur_rw,cur_rh),raw).transpose(Image.FLIP_TOP_BOTTOM)
+                if (cur_rw,cur_rh)!=(dw,dh):
+                    try: img=img.resize((dw,dh),Image.Resampling.LANCZOS)
+                    except: img=img.resize((dw,dh),Image.LANCZOS)
+                self.q_img.put(img)
+                last_transforms, last_trail, last_view, force_render = transforms, trail, view_state, False
             glfw.poll_events()
             now=time.perf_counter()
             s=(1.0/60.0)-(now-last_t)
@@ -341,5 +380,6 @@ class RobotGPURenderer:
 
         fbo.release()
         if box_vao: box_vao.release(); box_vbo.release()
+        if trail_vao: trail_vao.release(); trail_vbo.release()
         glfw.destroy_window(win); glfw.terminate()
         print('[GPURender] Stopped.')

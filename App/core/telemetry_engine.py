@@ -15,6 +15,9 @@ class TelemetryEngine:
         self.cumulative_cost_tl = 0.0
         self.current_power = 0.0
         self.power_history = [0.0] * 100
+        # Grafik döngü hızından bağımsız olsun: 100 örnek x 1/30 sn = son ~3.3 sn
+        self.history_interval = 1.0 / 30.0
+        self._history_elapsed = 0.0
 
     def apply_payload_settings(self, payload_val, tariff_val, efficiency_val):
         try:
@@ -74,6 +77,9 @@ class TelemetryEngine:
             self.cumulative_cost_tl = self.cumulative_energy_kwh * self.electricity_rate
             
             # Update history graph data
-            self.power_history.append(self.current_power)
-            if len(self.power_history) > 100:
-                self.power_history.pop(0)
+            self._history_elapsed += dt
+            if self._history_elapsed >= self.history_interval:
+                self._history_elapsed = 0.0
+                self.power_history.append(self.current_power)
+                if len(self.power_history) > 100:
+                    self.power_history.pop(0)
