@@ -241,25 +241,33 @@ class RobotKontrolApp(ctk.CTk):
             self.status_message = "IK Hesaplandı! Rota güvenli (Çarpışma yok). Yörünge seçin."
 
     def execute_trajectory(self, strategy):
+        duration = self.kinematics_engine.time_fast if strategy == "fast" else self.kinematics_engine.time_eco
+        strat_name = "Hızlı" if strategy == "fast" else "Ekonomik"
+        self.start_trajectory(strategy, self.kinematics_engine.pending_waypoints, duration,
+                              f"{strat_name} Rota başlatıldı. Süzülüyor...")
+
+    def start_trajectory(self, strategy, waypoints, duration, status_text):
         if self.sim_engine.e_stop_active:
             self.status_message = "E-STOP AKTİF! Önce Sıfırlayın."
             return
-            
+        if getattr(self, "is_trajectory_playing", False):
+            self.status_message = "Robot hareket ediyor, hareket bitince tekrar deneyin."
+            return
+
+        # Bitince butonlar önceki hâline döner (ör. riskli rotada kilitli kalmaya devam etmeli)
+        self.traj_btn_states = (self.page_ik.btn_fast_traj.cget("state"), self.page_ik.btn_eco_traj.cget("state"))
         self.page_ik.btn_fast_traj.configure(state="disabled")
         self.page_ik.btn_eco_traj.configure(state="disabled")
-        
-        duration = self.kinematics_engine.time_fast if strategy == "fast" else self.kinematics_engine.time_eco
-        strat_name = "Hızlı" if strategy == "fast" else "Ekonomik"
-        self.status_message = f"{strat_name} Rota başlatıldı. Süzülüyor..."
+        self.status_message = status_text
 
         with self.data_lock:
             current_angles = [self.shared_targets[i] for i in range(len(self.sim_engine.revolute_joints))]
 
+        self.is_trajectory_playing = True
         threading.Thread(target=self.run_trajectory_thread,
-                         args=(strategy, self.kinematics_engine.pending_waypoints, current_angles, duration), daemon=True).start()
+                         args=(strategy, waypoints, current_angles, duration), daemon=True).start()
 
     def run_trajectory_thread(self, strategy, waypoints, start_angles, total_duration):
-        self.is_trajectory_playing = True
         num_waypoints = len(waypoints)
         duration_per_wp = total_duration / num_waypoints
         current = start_angles
@@ -299,15 +307,13 @@ class RobotKontrolApp(ctk.CTk):
             self.status_message = f"UYARI: {desc}! Hareket iptal edildi."
             return
 
+        # Işınlamak yerine Eko rotanın S-eğrisiyle oraya gider; süre Eko rota tahminiyle aynı ölçekte
         with self.data_lock:
-            for i in range(min(len(angles), len(self.page_manual.slider_vars), len(self.shared_targets))):
-                self.page_manual.slider_vars[i].set(angles[i])
-                self.shared_targets[i] = angles[i]
-
-        with self.sim_engine.bullet_lock:
-            for i, joint_idx in enumerate(self.sim_engine.revolute_joints):
-                if i < len(angles): p.resetJointState(self.sim_engine.robotId, joint_idx, angles[i])
-            if self.kinematics_engine.show_workspace: self.kinematics_engine.draw_swept_volume()
+            current = list(self.shared_targets)
+        prismatic = self.kinematics_engine.prismatic_joint_flags()
+        max_deg = max([abs(math.degrees(a - c)) for a, c, lin in zip(angles, current, prismatic) if not lin] or [0.0])
+        duration = max(0.5, max_deg / 100.0) * 1.8
+        self.start_trajectory("eco", [angles], duration, "Manevra konumuna gidiliyor...")
 
     def make_scroll_smooth(self, scrollable_frame, step_px=50):
         def _on_wheel(event):
@@ -524,8 +530,9 @@ class RobotKontrolApp(ctk.CTk):
             self.trajectory_finished = False
             self.save_position()
             self.is_trajectory_playing = False
-            self.page_ik.btn_fast_traj.configure(state="normal")
-            self.page_ik.btn_eco_traj.configure(state="normal")
+            fast_state, eco_state = getattr(self, "traj_btn_states", ("normal", "normal"))
+            self.page_ik.btn_fast_traj.configure(state=fast_state)
+            self.page_ik.btn_eco_traj.configure(state=eco_state)
 
         img = None
         while not self.q_img.empty():

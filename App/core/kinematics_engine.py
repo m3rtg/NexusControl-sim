@@ -36,6 +36,7 @@ class KinematicsEngine:
         
         # Output artifacts
         self.pending_waypoints = []
+        self.pending_waypoint_safety = []
         self.time_fast = 0.0
         self.time_eco = 0.0
         self.peak_power_fast = 0.0
@@ -176,6 +177,9 @@ class KinematicsEngine:
             
         x_m, y_m, z_m = x_cm / 100.0, y_cm / 100.0, z_cm / 100.0
         self.pending_waypoints = []
+        # IK araması her waypoint için güvenlik kontrolünü zaten yapıyor; sonuç burada tutulur,
+        # rapor ve Manevra butonları tekrar hesaplamaz.
+        self.pending_waypoint_safety = []
         n_joints = len(self.sim_engine.revolute_joints)
         prismatic = self.prismatic_joint_flags()
         ee_chain = self.ee_chain_joints()
@@ -260,15 +264,18 @@ class KinematicsEngine:
 
                 wp1, err1, safe1, desc1 = solve_ik_pose([cx, cy, safe_z])
                 self.pending_waypoints.append(wp1)
+                self.pending_waypoint_safety.append((safe1, desc1))
 
                 wp2, err2, safe2, desc2 = solve_ik_pose([x_m, y_m, safe_z])
                 self.pending_waypoints.append(wp2)
+                self.pending_waypoint_safety.append((safe2, desc2))
 
                 math_log += f">> OTONOM KAÇIŞ AKTİF: Engel Algılandı.\n"
                 math_log += f">> {safe_z * 100:.0f}cm irtifadan U-Dönüş rotası çizildi.\n\n"
 
             final_angles, final_err, final_safe, final_desc = solve_ik_pose([x_m, y_m, z_m])
             self.pending_waypoints.append(final_angles)
+            self.pending_waypoint_safety.append((final_safe, final_desc))
 
         deg_diffs = [abs(math.degrees(self.pending_waypoints[-1][i] - current_joint_angles[i])) for i in range(min(n_joints, len(current_joint_angles)))
                      if not (i < len(prismatic) and prismatic[i])]
@@ -328,8 +335,7 @@ class KinematicsEngine:
         math_log += ">> Adım 4: SANAL GÜVENLİK & ÇARPIŞMA ANALİZİ\n"
         has_collision_risk = False
         collision_warning_text = ""
-        for idx, wp in enumerate(self.pending_waypoints, 1):
-            is_safe, desc = self.check_angles_safety(wp)
+        for idx, (is_safe, desc) in enumerate(self.pending_waypoint_safety, 1):
             if is_safe:
                 math_log += f"  [✓] Manevra {idx}: Güvenli (Çarpışmasız rota)\n"
             else:
