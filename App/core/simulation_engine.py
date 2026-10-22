@@ -21,6 +21,8 @@ class SimulationEngine:
         self.obstacle_scale = 1.0
         self.obstacle_keep_out = 0.0
         self.e_stop_active = False
+        # Eklem başına motor tork sınırı; TelemetryEngine.calibrate_motors robot ağırlığına göre ayarlar
+        self.motor_forces = []
         
         # For GPU renderer sharing
         self.gpu_state_lock = None
@@ -111,7 +113,8 @@ class SimulationEngine:
                     if i < len(targets):
                         p.setJointMotorControl2(
                             self.robotId, joint_idx, p.POSITION_CONTROL,
-                            targetPosition=targets[i], force=800, maxVelocity=4.0,
+                            targetPosition=targets[i], force=self.motor_forces[i] if i < len(self.motor_forces) else 800,
+                            maxVelocity=4.0,
                             positionGain=0.15, velocityGain=1.0
                         )
                 p.stepSimulation()

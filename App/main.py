@@ -107,7 +107,9 @@ class RobotKontrolApp(ctk.CTk):
         self.grid_columnconfigure(3, weight=4, minsize=320)
 
         # 1. NAVBAR
-        self.sidebar = ctk.CTkFrame(self, corner_radius=0, fg_color="#141414")
+        # Kaydırılabilir: Yük ve Enerji kartıyla içerik ~815 px; küçük ekranlarda/ölçeklemede alt kısım kesilmesin
+        self.sidebar = ctk.CTkScrollableFrame(self, corner_radius=0, fg_color="#141414",
+                                              scrollbar_button_color="#2A2A2A", scrollbar_button_hover_color="#3A3A3A")
         self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
 
         logo_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -130,6 +132,31 @@ class RobotKontrolApp(ctk.CTk):
         ctk.CTkButton(obs_frame, text="Rastgele", height=40, fg_color="#555555", command=self.randomize_obstacle).grid(row=0, column=1, sticky="ew")
 
         ctk.CTkButton(self.sidebar, text="E-STOP SIFIRLA", height=40, fg_color="#8B0000", command=self.reset_estop).pack(pady=(20, 8), padx=10, fill="x")
+
+        # Yük ve Enerji Ayarları (IK sayfasından taşındı; tüm sayfalarda geçerli)
+        energy_card = ctk.CTkFrame(self.sidebar, fg_color="#1E1E1E", corner_radius=8)
+        energy_card.pack(pady=(10, 6), padx=10, fill="x")
+        ctk.CTkLabel(energy_card, text="⚙️ YÜK VE ENERJİ", font=ctk.CTkFont(size=11, weight="bold"), text_color="#FFB300").pack(pady=(6, 2), padx=8, anchor="w")
+        grid = ctk.CTkFrame(energy_card, fg_color="transparent")
+        grid.pack(fill="x", padx=8)
+        grid.grid_columnconfigure(0, weight=1)
+        grid.grid_columnconfigure(1, weight=1)
+        def field(row, col, label, default):
+            cell = ctk.CTkFrame(grid, fg_color="transparent")
+            cell.grid(row=row, column=col, sticky="ew", padx=(0, 3) if col == 0 else (3, 0), pady=1)
+            ctk.CTkLabel(cell, text=label, font=ctk.CTkFont(size=10), text_color="#AAAAAA", height=14).pack(anchor="w")
+            entry = ctk.CTkEntry(cell, height=26, font=ctk.CTkFont(size=11))
+            entry.insert(0, default)
+            entry.pack(fill="x")
+            return entry
+        self.entry_payload = field(0, 0, "Yük (kg)", "0.0")
+        self.entry_robot_mass = field(0, 1, "Robot (kg)", "")
+        self.entry_tariff = field(1, 0, "TL / kWh", "4.50")
+        self.entry_efficiency = field(1, 1, "Verim (%)", "85")
+        self.lbl_mass_source = ctk.CTkLabel(energy_card, text="", font=ctk.CTkFont(size=9), text_color="#777777", height=12)
+        self.lbl_mass_source.pack(padx=8, anchor="w")
+        ctk.CTkButton(energy_card, text="⚡ Uygula", height=26, fg_color="#332B10", hover_color="#4A3E14", text_color="#FFD700",
+                      font=ctk.CTkFont(size=11, weight="bold"), command=self.apply_energy_settings).pack(pady=(2, 8), padx=8, fill="x")
 
         # Kalite Seçici
         self.quality_menu = ctk.CTkOptionMenu(self.sidebar, values=["Standard (600p)", "HD (1.5× SS)", "FHD (2× SS)"], command=self.set_render_quality)
@@ -226,6 +253,12 @@ class RobotKontrolApp(ctk.CTk):
         state = self.kinematics_engine.toggle_workspace()
         self.btn_nav_workspace.configure(text="Saydam İzi Temizle" if state else "Saydam İzi Göster")
 
+    def apply_energy_settings(self):
+        self.status_message = self.telemetry_engine.apply_payload_settings(
+            self.entry_payload.get(), self.entry_tariff.get(), self.entry_efficiency.get(), self.entry_robot_mass.get())
+        self.entry_robot_mass.delete(0, "end")
+        self.entry_robot_mass.insert(0, f"{self.telemetry_engine.robot_mass_kg:.1f}")
+
     def reset_energy_counter(self):
         self.status_message = self.telemetry_engine.reset_energy_counter()
 
@@ -280,7 +313,16 @@ class RobotKontrolApp(ctk.CTk):
         # Tek süre verilirse segmentlere eşit bölünür; liste verilirse her segmentin kendi süresi
         durations = total_duration if isinstance(total_duration, list) else [total_duration / num_waypoints] * num_waypoints
         current = start_angles
+        try:
+            self._play_waypoints(strategy, waypoints, current, durations)
+        finally:
+            self.telemetry_engine.clear_playback_state()
 
+        if not self.sim_engine.e_stop_active: self.status_message = f"Robot hedefe başarıyla yerleşti!"
+        # Tk thread-safe değil: kayıt ve buton güncellemesi update_ui_loop'ta (ana thread) yapılır
+        self.trajectory_finished = True
+
+    def _play_waypoints(self, strategy, waypoints, current, durations):
         for wp_idx, target_angles in enumerate(waypoints):
             duration_per_wp = durations[wp_idx]
             steps = int(max(duration_per_wp * 30, 5))
@@ -288,15 +330,17 @@ class RobotKontrolApp(ctk.CTk):
 
             for step in range(1, steps + 1):
                 if self.sim_engine.e_stop_active: break
-                t = step / steps
-                factor = t if strategy == "fast" else (1 - math.cos(math.pi * t)) / 2.0
-                angles = [c + (tr - c) * factor for c, tr in zip(current, target_angles)]
+                angles, qd, qdd = self.kinematics_engine.profile_state(current, target_angles, duration_per_wp, strategy, step / steps)
 
                 with self.sim_engine.bullet_lock:
                     if self.sim_engine.e_stop_active: break
                     for i, joint_idx in enumerate(self.sim_engine.revolute_joints):
                         if i < len(angles): p.resetJointState(self.sim_engine.robotId, joint_idx, angles[i])
                     if self.kinematics_engine.show_workspace: self.kinematics_engine.draw_swept_volume()
+                    # Eklemler doğrudan konumlandığı için fizik tork görmez; güç grafiği ters dinamikten beslenir
+                    if len(angles) == len(self.sim_engine.revolute_joints) and self.telemetry_engine.dynamics_ok:
+                        tau = self.telemetry_engine.joint_torques(angles, qd, qdd)
+                        self.telemetry_engine.set_playback_state(qd, tau)
 
                 with self.data_lock:
                     if self.sim_engine.e_stop_active: break
@@ -307,10 +351,6 @@ class RobotKontrolApp(ctk.CTk):
 
             if self.sim_engine.e_stop_active: break
             current = target_angles
-
-        if not self.sim_engine.e_stop_active: self.status_message = f"Robot hedefe başarıyla yerleşti!"
-        # Tk thread-safe değil: kayıt ve buton güncellemesi update_ui_loop'ta (ana thread) yapılır
-        self.trajectory_finished = True
 
     def route_position(self, angles, waypoints):
         """Robot rotadaki bir waypoint'te duruyorsa onun indeksi, değilse None. Sadece TCP zincirindeki
@@ -376,6 +416,13 @@ class RobotKontrolApp(ctk.CTk):
         if canvas: canvas.bind("<MouseWheel>", _on_wheel, add="+")
 
     def on_model_loaded(self):
+        # Yeni modelin kendi ağırlığı alana yazılır; yük ve tarife alanları korunur ve yeni gövdeye uygulanır
+        self.entry_robot_mass.delete(0, "end")
+        self.entry_robot_mass.insert(0, f"{self.telemetry_engine.robot_mass_default:.1f}")
+        source = self.telemetry_engine.mass_source
+        self.lbl_mass_source.configure(text=f"Robot kütlesi: {source}" + (" (ρ=1.5 t/m³)" if "tahmini" in source else ""))
+        self.apply_energy_settings()
+
         # Hedef listesi ve konum geçmişi modelin eksen sayısına göre yeniden boyutlanır;
         # sabit 6 elemanlı liste 7. ve sonraki eksenlere (ör. gripper) komut gitmesini engelliyordu.
         n_joints = len(self.sim_engine.revolute_joints)
@@ -620,7 +667,7 @@ class RobotKontrolApp(ctk.CTk):
                 slider.configure(state="disabled" if self.sliders_locked else "normal")
 
         # Telemetry updates (Mockup for original system)
-        telemetry_text = f"Motor Verimi: %{self.telemetry_engine.motor_efficiency*100:.0f}\nYük: {self.telemetry_engine.payload_kg:.1f} kg\nDurum: {self.status_message}"
+        telemetry_text = f"Motor Verimi: %{self.telemetry_engine.motor_efficiency*100:.0f}\nYük: {self.telemetry_engine.payload_kg:.1f} kg | Robot: {self.telemetry_engine.robot_mass_kg:.0f} kg\nDurum: {self.status_message}"
         self.analysis_panel.update_telemetry(telemetry_text)
 
         # Graph updates

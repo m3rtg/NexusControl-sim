@@ -4,11 +4,17 @@ import re
 import math
 import numpy as np
 
+# URDF'te kütlesi verilmemiş linkler için yoğunluk (kg/m³), link geometrisinin konveks gövde hacmine uygulanır.
+# Robot gövdeleri içi boş döküm/alüminyum: IRB4400 ~920 kg verir (gerçek ~1040), Fanuc LR Mate ~44 kg (gerçek ~27).
+# Kullanıcı soldaki ayarlardan robotun gerçek ağırlığını girerek ölçekleyebilir.
+DEFAULT_LINK_DENSITY = 1500.0
+
 class RobotLoader:
     def __init__(self, sim_engine, kinematics_engine):
         self.sim_engine = sim_engine
         self.kinematics_engine = kinematics_engine
         self.known_packages = {}
+        self.last_mass_info = {"estimated": [], "root_mass": 0.0, "root_name": ""}
 
     def find_package_dir(self, pkg_name, context_path=None):
         if not pkg_name:
@@ -137,7 +143,82 @@ class RobotLoader:
 
         return None
 
+    def _link_geometry_hull(self, link):
+        """Linkin çarpışma (yoksa görsel) geometrilerinin link çerçevesindeki konveks gövdesi."""
+        import trimesh
+        points = []
+        for el in (link.findall("collision") or link.findall("visual")):
+            geom = el.find("geometry")
+            if geom is None: continue
+            org = el.find("origin")
+            xyz = [float(v) for v in (org.attrib.get("xyz", "0 0 0") if org is not None else "0 0 0").split()]
+            rpy = [float(v) for v in (org.attrib.get("rpy", "0 0 0") if org is not None else "0 0 0").split()]
+            mesh = None
+            if geom.find("mesh") is not None:
+                g = geom.find("mesh")
+                fn = g.attrib.get("filename", "")
+                if not os.path.isfile(fn): continue
+                mesh = trimesh.load(fn, force="mesh")
+                scale = [float(v) for v in g.attrib.get("scale", "1 1 1").split()]
+                mesh.apply_transform(np.diag(scale + [1.0]))
+            elif geom.find("box") is not None:
+                mesh = trimesh.creation.box(extents=[float(v) for v in geom.find("box").attrib.get("size", "0 0 0").split()])
+            elif geom.find("cylinder") is not None:
+                g = geom.find("cylinder")
+                mesh = trimesh.creation.cylinder(radius=float(g.attrib.get("radius", 0)), height=float(g.attrib.get("length", 0)))
+            elif geom.find("sphere") is not None:
+                mesh = trimesh.creation.icosphere(radius=float(geom.find("sphere").attrib.get("radius", 0)))
+            if mesh is None or len(mesh.vertices) == 0: continue
+            # URDF rpy sabit eksenlerde X, Y, Z sırasıyla döner (trimesh 'sxyz')
+            tf = trimesh.transformations.euler_matrix(rpy[0], rpy[1], rpy[2], 'sxyz')
+            tf[:3, 3] = xyz
+            mesh.apply_transform(tf)
+            points.append(mesh.convex_hull.vertices)
+        if not points: return None
+        return trimesh.convex.convex_hull(np.vstack(points))
+
+    def _fill_missing_inertials(self, root):
+        """<inertial> olmayan linklere pybullet 1 kg ve link orijininde kütle merkezi verir: büyük robotlar
+        birkaç kg, Fanuc'un tool0/flange gibi çerçeve linkleri bileğe fazladan 1'er kg olur. Geometrisi olan
+        linklere hacimden kütle, kütle merkezi ve atalet; olmayanlara ihmal edilebilir kütle yazılır."""
+        import xml.etree.ElementTree as ET
+        children = {j.find("child").attrib.get("link") for j in root.iter("joint") if j.find("child") is not None}
+        info = {"estimated": [], "root_mass": 0.0, "root_name": ""}
+        for link in root.findall("link"):
+            name = link.attrib.get("name", "")
+            inertial = link.find("inertial")
+            if inertial is None:
+                hull = None
+                try:
+                    hull = self._link_geometry_hull(link)
+                except Exception as e:
+                    print(f"[Kütle Tahmini] {name}: {e}")
+                if hull is not None and hull.volume > 1e-7:
+                    hull.density = DEFAULT_LINK_DENSITY
+                    mass, com, inertia = float(hull.mass), hull.center_mass, hull.moment_inertia
+                    info["estimated"].append(name)
+                else:
+                    mass, com, inertia = 0.001, (0.0, 0.0, 0.0), np.eye(3) * 1e-6
+                # Bullet'in ters dinamik modeli, ataleti eklem çerçevesine taşırken I(1,2) == I(2,1) eşitliğini
+                # ~1e-15 toleransla kontrol ediyor; büyük kütle x kütle merkezi kaymasında yuvarlama hatası bunu
+                # bozup hesabı reddettiriyordu (IRB4400 link_1: 514 kg, 56 cm kayma). Kütle merkezi 1/1024 m,
+                # kütle 1/256 kg ızgarasına yuvarlanınca çarpımlar tam çıkar; atalet köşegen yazılır.
+                com = [round(float(c) * 1024.0) / 1024.0 for c in com]
+                mass = max(1.0 / 256.0, round(mass * 256.0) / 256.0) if mass >= 1.0 / 256.0 else mass
+                inertial = ET.SubElement(link, "inertial")
+                ET.SubElement(inertial, "origin", xyz="%r %r %r" % tuple(com), rpy="0 0 0")
+                ET.SubElement(inertial, "mass", value=repr(mass))
+                ET.SubElement(inertial, "inertia",
+                              ixx="%.6g" % max(inertia[0][0], 1e-6), ixy="0", ixz="0",
+                              iyy="%.6g" % max(inertia[1][1], 1e-6), iyz="0", izz="%.6g" % max(inertia[2][2], 1e-6))
+            if name not in children:
+                info["root_name"] = name
+                m_el = inertial.find("mass")
+                info["root_mass"] = float(m_el.attrib.get("value", 0.0)) if m_el is not None else 0.0
+        return info
+
     def sanitize_and_resolve_urdf(self, urdf_path, context_dir=None):
+        self.last_mass_info = {"estimated": [], "root_mass": 0.0, "root_name": ""}
         try:
             import xml.etree.ElementTree as ET
             app_dir = os.path.dirname(os.path.abspath(__file__))
@@ -161,6 +242,8 @@ class RobotLoader:
                         cyl = ET.SubElement(geom, "cylinder")
                         cyl.attrib["radius"] = "0.04"
                         cyl.attrib["length"] = "0.18"
+
+            self.last_mass_info = self._fill_missing_inertials(root)
 
             base_name = os.path.splitext(os.path.basename(urdf_path))[0]
             if base_name.startswith("."): base_name = base_name[1:]
@@ -393,7 +476,12 @@ class RobotLoader:
             while curr != shoulder_idx and curr >= 0 and curr not in visited:
                 visited.add(curr)
                 info = p.getJointInfo(self.sim_engine.robotId, curr)
-                arm_len_m += math.sqrt(sum(x**2 for x in info[14]))
+                # Ebeveyn link çerçevesinden bu eklemin çerçevesine mesafe. getJointInfo[14] ebeveynin kütle
+                # merkezine göredir; kütle merkezi tahmin edilen modellerde uzunluğu değiştirirdi.
+                child_pos = p.getLinkState(self.sim_engine.robotId, curr)[4]
+                parent_pos = (p.getLinkState(self.sim_engine.robotId, info[16])[4] if info[16] >= 0
+                              else p.getBasePositionAndOrientation(self.sim_engine.robotId)[0])
+                arm_len_m += math.sqrt(sum((a - b) ** 2 for a, b in zip(child_pos, parent_pos)))
                 curr = info[16]
             if arm_len_m > 0.1:
                 self.kinematics_engine.arm_length_cm = arm_len_m * 100.0 * 0.94
@@ -439,6 +527,15 @@ class RobotLoader:
             # Eklemle bağlı ya da duruşta zaten değen link çiftleri birbirini itmesin
             for lA, lB in allowed_cols:
                 p.setCollisionFilterPair(self.sim_engine.robotId, self.sim_engine.robotId, lA, lB, 0)
+
+            # Kütle modeli, motor katsayıları ve yük: kaide hariç robot kütlesi buradan başlar
+            mass_info = dict(self.last_mass_info)
+            mass_info["estimated_mass"] = sum(
+                p.getDynamicsInfo(self.sim_engine.robotId, li)[0] for li in range(num_joints)
+                if link_names.get(li) in mass_info["estimated"] and li != stand_link_idx)
+            if any(s in mass_info.get("root_name", "").lower() for s in ['stand', 'table', 'pedestal', 'sehp', 'kaide']):
+                mass_info["root_mass"] = 0.0
+            self.kinematics_engine.telemetry.on_robot_loaded(stand_link_idx, mass_info)
 
             try:
                 shapes = p.getVisualShapeData(self.sim_engine.robotId)
