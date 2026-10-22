@@ -109,7 +109,8 @@ class RobotKontrolApp(ctk.CTk):
 
         # 1. NAVBAR
         # Kaydırılabilir: içerik ~690 px; küçük ekranlarda/ölçeklemede alt kısım kesilmesin
-        self.sidebar = ctk.CTkScrollableFrame(self, corner_radius=0, fg_color="#141414",
+        # Genişlik eski sabit çerçevenin içerikten aldığı ~306 px; varsayılan 200 px butonları kesiyordu
+        self.sidebar = ctk.CTkScrollableFrame(self, corner_radius=0, fg_color="#141414", width=286,
                                               scrollbar_button_color="#2A2A2A", scrollbar_button_hover_color="#3A3A3A")
         self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
 
@@ -130,8 +131,8 @@ class RobotKontrolApp(ctk.CTk):
         obs_frame.pack(pady=8, padx=10, fill="x")
         obs_frame.grid_columnconfigure(0, weight=3)
         obs_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkButton(obs_frame, text="Engel Aç/Kapat", height=40, fg_color="#D2691E", command=self.toggle_obstacle).grid(row=0, column=0, padx=(0, 5), sticky="ew")
-        ctk.CTkButton(obs_frame, text="Rastgele", height=40, fg_color="#555555", command=self.randomize_obstacle).grid(row=0, column=1, sticky="ew")
+        ctk.CTkButton(obs_frame, text="Engel Aç/Kapat", width=60, height=40, fg_color="#D2691E", command=self.toggle_obstacle).grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        ctk.CTkButton(obs_frame, text="Rastgele", width=60, height=40, fg_color="#555555", command=self.randomize_obstacle).grid(row=0, column=1, sticky="ew")
 
         ctk.CTkButton(self.sidebar, text="E-STOP SIFIRLA", height=40, fg_color="#8B0000", command=self.reset_estop).pack(pady=(20, 8), padx=10, fill="x")
 
@@ -148,8 +149,8 @@ class RobotKontrolApp(ctk.CTk):
         btn_model_frame.pack(pady=3, padx=10, fill="x")
         btn_model_frame.grid_columnconfigure(0, weight=1)
         btn_model_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkButton(btn_model_frame, text="⭐ Ana Model", height=30, fg_color="#332B10", text_color="#FFD700", command=self.set_current_as_default).grid(row=0, column=0, padx=(0, 3), sticky="ew")
-        ctk.CTkButton(btn_model_frame, text="↺ Orijinal", height=30, fg_color="#2A2A2A", command=self.reset_default_robot).grid(row=0, column=1, padx=(3, 0), sticky="ew")
+        ctk.CTkButton(btn_model_frame, text="⭐ Ana Model", width=60, height=30, fg_color="#332B10", text_color="#FFD700", command=self.set_current_as_default).grid(row=0, column=0, padx=(0, 3), sticky="ew")
+        ctk.CTkButton(btn_model_frame, text="↺ Orijinal", width=60, height=30, fg_color="#2A2A2A", command=self.reset_default_robot).grid(row=0, column=1, padx=(3, 0), sticky="ew")
         
         self.lbl_default_info = ctk.CTkLabel(self.sidebar, text="Açılış: Fanuc", font=ctk.CTkFont(size=10))
         self.lbl_default_info.pack(pady=(1, 6))
