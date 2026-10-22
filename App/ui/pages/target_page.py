@@ -1,7 +1,7 @@
 import math
 import customtkinter as ctk
 from ui import theme
-from ui.i18n import t
+from i18n import t
 from ui.widgets.reach_map import ReachMap
 
 def _num(text):

@@ -1,6 +1,6 @@
 import tkinter as tk
 from ui import theme
-from ui.i18n import t
+from i18n import t
 
 class ReachMap(tk.Canvas):
     """Üstten görünüş: erişim halkası, kaide, engel, uç işlevcinin şu anki yeri ve hedef. Tıklanan nokta X/Y olur.

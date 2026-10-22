@@ -1,6 +1,6 @@
 import customtkinter as ctk
 from ui import theme
-from ui.i18n import t
+from i18n import t
 
 class ModelPage(ctk.CTkFrame):
     """Yüklü model bilgisi; yeni model yükleme, açılış modeli yapma, dahili modele dönme."""

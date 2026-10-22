@@ -1,7 +1,8 @@
 import tkinter as tk
 import customtkinter as ctk
 from ui import theme
-from ui.i18n import t
+from i18n import t
+from ui.widgets.estop_button import EStopButton
 
 class SidePanel(ctk.CTkFrame):
     """Sağ sütun: canlı güç, sahne araçları, durum ve hesap raporu."""
@@ -39,19 +40,32 @@ class SidePanel(ctk.CTkFrame):
         theme.button(grid, t("scene.random"), app.randomize_obstacle, width=60, height=30, font=theme.font(11)).grid(
             row=0, column=1, sticky="ew", padx=(3, 0), pady=(0, 6))
         self.btn_trail = theme.button(grid, t("scene.trail"), app.toggle_workspace, width=60, height=30, font=theme.font(11))
-        self.btn_trail.grid(row=1, column=0, sticky="ew", padx=(0, 3))
+        self.btn_trail.grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=(0, 6))
+        theme.button(grid, t("scene.clear_trail"), app.clear_trail, width=60, height=30, font=theme.font(11)).grid(
+            row=1, column=1, sticky="ew", padx=(3, 0), pady=(0, 6))
         theme.button(grid, t("scene.camera"), app.reset_camera, width=60, height=30, font=theme.font(11)).grid(
-            row=1, column=1, sticky="ew", padx=(3, 0))
+            row=2, column=0, columnspan=2, sticky="ew")
 
-        # --- Durum ---
+        # --- Acil stop + durum ---
         status = theme.card(self)
         status.pack(fill="x", pady=(theme.PAD, 0))
-        theme.section(status, t("status.section")).pack(fill="x", padx=12, pady=(10, 4))
-        self.lbl_status = ctk.CTkLabel(status, text="", font=theme.font(11), text_color=theme.OK, anchor="w",
-                                       justify="left", wraplength=236)
-        self.lbl_status.pack(fill="x", padx=12)
-        self.lbl_tcp = self._row(status, t("status.tcp"))
-        self.lbl_load = self._row(status, t("status.load"), pady=(0, 10))
+        theme.section(status, t("status.section")).pack(fill="x", padx=12, pady=(10, 6))
+        body = ctk.CTkFrame(status, fg_color="transparent")
+        body.pack(fill="x", padx=12, pady=(0, 10))
+        body.grid_columnconfigure(1, weight=1)
+        stop_col = ctk.CTkFrame(body, fg_color="transparent")
+        stop_col.grid(row=0, column=0, sticky="n", padx=(0, 12))
+        self.estop_btn = EStopButton(stop_col, app.press_estop, size=60, bg=theme.BG2)
+        self.estop_btn.pack()
+        self.btn_reset = theme.button(stop_col, t("topbar.reset"), app.reset_estop, kind="danger", width=60, height=24,
+                                      font=theme.font(10, "bold"))
+        info = ctk.CTkFrame(body, fg_color="transparent")
+        info.grid(row=0, column=1, sticky="nsew")
+        self.lbl_status = ctk.CTkLabel(info, text="", font=theme.font(11), text_color=theme.OK, anchor="w",
+                                       justify="left", wraplength=168)
+        self.lbl_status.pack(fill="x")
+        self.lbl_tcp = self._row(info, t("status.tcp"), padx=0)
+        self.lbl_load = self._row(info, t("status.load"), padx=0)
 
         # --- Rapor ---
         report = theme.card(self)
@@ -62,9 +76,9 @@ class SidePanel(ctk.CTkFrame):
         self.report.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.set_report(t("report.empty"))
 
-    def _row(self, parent, label, pady=(0, 2)):
+    def _row(self, parent, label, pady=(0, 2), padx=12):
         row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=12, pady=pady)
+        row.pack(fill="x", padx=padx, pady=pady)
         ctk.CTkLabel(row, text=label, font=theme.font(10), text_color=theme.MUTED, height=16).pack(side="left")
         value = ctk.CTkLabel(row, text="", font=theme.font(10, mono=True), text_color=theme.FG, height=16)
         value.pack(side="right")
@@ -107,6 +121,11 @@ class SidePanel(ctk.CTkFrame):
         self.report.delete("0.0", "end")
         self.report.insert("end", text.strip("\n"))
         self.report.configure(state="disabled")
+
+    def set_estop(self, active):
+        self.estop_btn.set_active(active)
+        if active: self.btn_reset.pack(pady=(6, 0))
+        else: self.btn_reset.pack_forget()
 
     def set_obstacle(self, on):
         theme.set_button_kind(self.btn_obstacle, "hot" if on else "secondary")

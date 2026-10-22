@@ -1,7 +1,7 @@
 import tkinter as tk
 import customtkinter as ctk
 from ui import theme
-from ui.i18n import t
+from i18n import t
 
 def _blend(c1, c2, f):
     a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]

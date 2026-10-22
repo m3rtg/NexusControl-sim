@@ -1,7 +1,7 @@
 import customtkinter as ctk
 import pybullet as p
 from ui import theme
-from ui.i18n import t
+from i18n import t
 
 SOURCE_KEYS = ("auto", "total", "labels")
 

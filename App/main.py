@@ -1,5 +1,7 @@
 import os
+import sys
 import gc
+import subprocess
 import time
 import math
 import json
@@ -17,14 +19,13 @@ from core.telemetry_engine import TelemetryEngine
 from core.robot_loader import RobotLoader
 
 from ui import theme
-from ui import i18n
-from ui.i18n import t
+import i18n
+from i18n import t
 from ui.pages.jog_page import JogPage
 from ui.pages.target_page import TargetPage
 from ui.pages.energy_page import EnergyPage
 from ui.pages.model_page import ModelPage
 from ui.pages.settings_page import SettingsPage
-from ui.widgets.estop_button import EStopButton
 from ui.widgets.route_timeline import RouteTimeline
 from ui.widgets.side_panel import SidePanel
 from render_engine import RobotGPURenderer
@@ -62,7 +63,7 @@ class RobotKontrolApp(ctk.CTk):
         self.q_telemetry = queue.Queue(maxsize=1)
         self.tk_img = None
 
-        self.status_message = "SİSTEM AKTİF - BEKLEMEDE"
+        self.status_message = t("msg.idle")
         self.current_page = "manual"
         
         self.gpu_state_lock = threading.RLock()
@@ -127,14 +128,19 @@ class RobotKontrolApp(ctk.CTk):
         change.pack(side="left")
         change.bind("<Button-1>", lambda e: self.show_page("model"))
 
-        self.estop_btn = EStopButton(top, self.press_estop)
-        self.estop_btn.pack(side="right")
-        self.btn_reset_estop = theme.button(top, t("topbar.reset"), self.reset_estop, kind="danger", width=80, height=30)
         self.lbl_pill = ctk.CTkLabel(top, text=t("pill.ready"), font=theme.font(11, "bold"), text_color=theme.OK,
                                      fg_color=theme.BG2, corner_radius=999, height=28)
-        self.lbl_pill.pack(side="right", padx=(0, 14), ipadx=10)
-        langs = " | ".join(l.upper() for l in i18n.available_languages())
-        ctk.CTkLabel(top, text=langs, font=theme.font(11, "bold"), text_color=theme.FG2).pack(side="right", padx=(0, 16))
+        self.lbl_pill.pack(side="right", ipadx=10)
+        # TR | EN: aktif dil beyaz, diğeri tıklanabilir
+        lang_box = ctk.CTkFrame(top, fg_color="transparent")
+        lang_box.pack(side="right", padx=(0, 18))
+        for k, code in enumerate(i18n.available_languages()):
+            if k: ctk.CTkLabel(lang_box, text="|", font=theme.font(11), text_color=theme.BORDER2).pack(side="left", padx=4)
+            active = code == i18n.language()
+            lbl = ctk.CTkLabel(lang_box, text=code.upper(), font=theme.font(11, "bold"),
+                               text_color=theme.FG if active else theme.MUTED, cursor="" if active else "hand2")
+            lbl.pack(side="left")
+            if not active: lbl.bind("<Button-1>", lambda e, c=code: self.set_language(c))
 
         # --- GÖVDE ---
         body = ctk.CTkFrame(self, fg_color="transparent")
@@ -147,7 +153,7 @@ class RobotKontrolApp(ctk.CTk):
         dial.grid(row=0, column=0, sticky="ns", padx=(0, theme.PAD))
         self.mode_buttons = {}
         for mode in ("jog", "target", "energy", "model", "settings"):
-            b = ctk.CTkButton(dial, text=t(f"mode.{mode}"), width=58, height=56, corner_radius=10, fg_color="transparent",
+            b = ctk.CTkButton(dial, text=t(f"mode.{mode}"), width=58, height=62, corner_radius=10, fg_color="transparent",
                               hover_color=theme.BG3, text_color=theme.MUTED, font=theme.font(11),
                               command=lambda m=mode: self.show_page(m))
             b.pack(padx=6, pady=(6 if mode == "jog" else 2, 2))
@@ -225,10 +231,19 @@ class RobotKontrolApp(ctk.CTk):
         with self.gpu_state_lock: self.gpu_shared_state.update(home)
 
     def set_language(self, lang):
+        if lang == i18n.language(): return
         cfg = self.load_config()
         cfg["language"] = lang
         self.save_config(cfg)
-        self.status_message = t("settings.language_hint")
+        # Metinler pencere kurulurken atanıyor; yeni dil yeniden başlatınca tamamen geçerli olur
+        if messagebox.askyesno(t("settings.restart_title"), t("settings.restart_prompt")):
+            self.restart_requested = True
+            self.on_closing()
+        else:
+            self.status_message = t("settings.restart_later")
+
+    def clear_trail(self):
+        self.kinematics_engine.clear_trail()
 
     def reset_estop(self):
         self.estop_reason = None
@@ -278,23 +293,22 @@ class RobotKontrolApp(ctk.CTk):
                                 playable, k.time_fast, k.time_eco)
 
         if has_risk or err > 0.03:
-            fail_reason = desc if has_risk else f"Hedef Ulaşılamaz ({err * 100:.1f} cm sapma)"
-            self.status_message = f"UYARI: {fail_reason}! Hareket kilitlendi."
+            fail_reason = desc if has_risk else t("msg.unreachable", cm=f"{err * 100:.1f}")
+            self.status_message = t("msg.ik_blocked", reason=fail_reason)
         else:
-            self.status_message = "IK Hesaplandı! Rota güvenli (Çarpışma yok). Yörünge seçin."
+            self.status_message = t("msg.ik_ok")
 
     def execute_trajectory(self, strategy):
         duration = self.kinematics_engine.time_fast if strategy == "fast" else self.kinematics_engine.time_eco
-        strat_name = "Hızlı" if strategy == "fast" else "Ekonomik"
         self.start_trajectory(strategy, self.kinematics_engine.pending_waypoints, duration,
-                              f"{strat_name} Rota başlatıldı. Süzülüyor...")
+                              t("msg.route_started", name=t("msg.fast" if strategy == "fast" else "msg.eco")))
 
     def start_trajectory(self, strategy, waypoints, duration, status_text):
         if self.sim_engine.e_stop_active:
-            self.status_message = "E-STOP AKTİF! Önce Sıfırlayın."
+            self.status_message = t("msg.estop_active")
             return
         if getattr(self, "is_trajectory_playing", False):
-            self.status_message = "Robot hareket ediyor, hareket bitince tekrar deneyin."
+            self.status_message = t("msg.busy")
             return
 
         # Bitince butonlar önceki hâline döner (ör. riskli rotada kilitli kalmaya devam etmeli)
@@ -319,7 +333,7 @@ class RobotKontrolApp(ctk.CTk):
         finally:
             self.telemetry_engine.clear_playback_state()
 
-        if not self.sim_engine.e_stop_active: self.status_message = f"Robot hedefe başarıyla yerleşti!"
+        if not self.sim_engine.e_stop_active: self.status_message = t("msg.arrived")
         # Tk thread-safe değil: kayıt ve buton güncellemesi update_ui_loop'ta (ana thread) yapılır
         self.trajectory_finished = True
 
@@ -376,7 +390,7 @@ class RobotKontrolApp(ctk.CTk):
         # değilse baştan başlayarak hedefe kadar sırayla oynatılır (hedef gerideyse ters sırayla).
         at = self.route_position(current, waypoints)
         if at == target_idx:
-            self.status_message = f"Robot zaten Manevra {target_idx + 1} konumunda."
+            self.status_message = t("msg.already_at", n=target_idx + 1)
             return
         if at is None:
             sequence = list(range(0, target_idx + 1))
@@ -394,15 +408,15 @@ class RobotKontrolApp(ctk.CTk):
             if is_safe:
                 is_safe, desc = self.kinematics_engine.check_path_safety(prev, wp)
             if not is_safe:
-                messagebox.showwarning("Çarpışma Engeli", f"Manevra {idx + 1} konumuna gidilemez:\n{desc}")
-                self.status_message = f"UYARI: Manevra {idx + 1}: {desc}! Hareket iptal edildi."
+                messagebox.showwarning(t("msg.collision_title"), t("msg.cannot_go", n=idx + 1, desc=desc))
+                self.status_message = t("msg.move_cancelled", n=idx + 1, desc=desc)
                 return
             # Her segment Eko rotanın S-eğrisi ve süre ölçeğiyle
             max_deg = max([abs(math.degrees(a - c)) for a, c, lin in zip(wp, prev, prismatic) if not lin] or [0.0])
             steps.append(wp); durations.append(max(0.5, max_deg / 100.0) * 1.8); prev = wp
 
-        label = f"Manevra {sequence[0] + 1}" if len(sequence) == 1 else f"Manevra {sequence[0] + 1} → {sequence[-1] + 1}"
-        self.start_trajectory("eco", steps, durations, f"{label} oynatılıyor...")
+        label = t("msg.waypoint", n=sequence[0] + 1) if len(sequence) == 1 else t("msg.waypoints", a=sequence[0] + 1, b=sequence[-1] + 1)
+        self.start_trajectory("eco", steps, durations, t("msg.playing", label=label))
 
     def make_scroll_smooth(self, scrollable_frame, step_px=50):
         def _on_wheel(event):
@@ -426,7 +440,7 @@ class RobotKontrolApp(ctk.CTk):
         page.entry_robot_mass.delete(0, "end")
         page.entry_robot_mass.insert(0, f"{self.telemetry_engine.robot_mass_default:.1f}")
         source = self.telemetry_engine.mass_source
-        page.lbl_mass_source.configure(text=t("energy.mass_source", source=source) + (t("energy.density_note") if "tahmini" in source else ""))
+        page.lbl_mass_source.configure(text=t("energy.mass_source", source=t(source)) + (t("energy.density_note") if source != "mass.urdf" else ""))
         self.apply_energy_settings()
 
         # Model bilgisi (üst çubuk ve Model paneli), kamera başlangıcı, eski rota temizlenir
@@ -436,7 +450,7 @@ class RobotKontrolApp(ctk.CTk):
         tel, kin = self.telemetry_engine, self.kinematics_engine
         n_axes = len(self.sim_engine.revolute_joints)
         self.lbl_model_line.configure(text=f"— {name} · {t('topbar.axes', n=n_axes)} · {tel.robot_mass_kg:.1f} kg")
-        self.page_model.update_info(name, os.path.basename(path), n_axes, tel.robot_mass_kg, tel.mass_source, kin.robot_reach_cm)
+        self.page_model.update_info(name, os.path.basename(path), n_axes, tel.robot_mass_kg, t(tel.mass_source), kin.robot_reach_cm)
         with self.gpu_state_lock:
             self.camera_home = {k: self.gpu_shared_state.get(k) for k in ("cam_dist", "cam_target", "cam_yaw", "cam_pitch")}
         kin.pending_waypoints, kin.pending_waypoint_labels, kin.pending_waypoint_safety = [], [], []
@@ -677,12 +691,12 @@ class RobotKontrolApp(ctk.CTk):
 
         estop = self.sim_engine.e_stop_active
         if estop:
-            reason = getattr(self, "estop_reason", None) or "ÇARPIŞMA TESPİT EDİLDİ"
+            reason = getattr(self, "estop_reason", None) or t("estop.collision")
             self.status_message = f"E-STOP: {reason}"
         self._apply_estop_ui(estop)
 
         playing = getattr(self, "is_trajectory_playing", False)
-        level = "err" if estop else ("busy" if playing else ("warn" if self.status_message.upper().startswith("UYARI") else "ok"))
+        level = "err" if estop else ("busy" if playing else ("warn" if self.status_message.upper().startswith(t("msg.warn_prefix")) else "ok"))
         self.side.set_status(self.status_message, level)
         pill = {"err": ("pill.estop", theme.ERR), "busy": ("pill.moving", theme.STEEL), "warn": ("pill.warning", theme.WARN),
                 "ok": ("pill.ready", theme.OK)}[level]
@@ -716,11 +730,9 @@ class RobotKontrolApp(ctk.CTk):
         """E-stop görünümü sadece durum değişince güncellenir (kart yeniden çizimi pahalı)."""
         if estop == getattr(self, "_estop_ui", None): return
         self._estop_ui = estop
-        self.estop_btn.set_active(estop)
+        self.side.set_estop(estop)
         self.stage.configure(border_color=theme.ERR if estop else theme.BORDER, border_width=2 if estop else 1)
         self.page_jog.set_locked(estop)
-        if estop: self.btn_reset_estop.pack(side="right", padx=(0, 10), before=self.estop_btn)
-        else: self.btn_reset_estop.pack_forget()
 
     def on_closing(self):
         self.is_running = False
@@ -731,3 +743,6 @@ class RobotKontrolApp(ctk.CTk):
 if __name__ == "__main__":
     app = RobotKontrolApp()
     app.mainloop()
+    if getattr(app, "restart_requested", False):
+        # Dil değişikliği: aynı komutla yeni bir süreç başlat
+        subprocess.Popen([sys.executable] + sys.argv, cwd=os.getcwd())

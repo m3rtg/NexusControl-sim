@@ -1,6 +1,6 @@
 import customtkinter as ctk
 from ui import theme
-from ui.i18n import t, available_languages, language
+from i18n import t, available_languages, language
 
 QUALITY = {"standard": "settings.quality_standard", "hd": "settings.quality_hd", "fhd": "settings.quality_fhd"}
 

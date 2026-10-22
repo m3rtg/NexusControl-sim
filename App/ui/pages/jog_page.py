@@ -3,7 +3,7 @@ import time
 import customtkinter as ctk
 import pybullet as p
 from ui import theme
-from ui.i18n import t
+from i18n import t
 from ui.widgets.joint_row import JointRow
 
 # Jog hızı: döner eksen derece/sn, lineer eksen eksen aralığının saniyedeki oranı

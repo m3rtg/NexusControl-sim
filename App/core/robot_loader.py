@@ -1,4 +1,5 @@
 import pybullet as p
+from i18n import t
 import os
 import re
 import math
@@ -259,7 +260,7 @@ class RobotLoader:
         try:
             import xacro
         except ImportError:
-            return None, "HATA: 'xacro' modülü yüklü değil! pip install xacro yapın."
+            return None, t("msg.xacro_missing")
 
         try:
             import sys
@@ -342,13 +343,13 @@ class RobotLoader:
 
     def load_source_model(self, file_path):
         if not file_path or not os.path.isfile(file_path):
-            return False, "Dosya bulunamadı", None
+            return False, t("msg.file_not_found"), None
 
         context_dir = os.path.dirname(os.path.abspath(file_path))
         if file_path.lower().endswith(".xacro"):
             urdf_path, err = self.convert_xacro_to_urdf(file_path)
             if not urdf_path:
-                return False, f"Xacro Derleme hatası: {err}", None
+                return False, t("msg.xacro_error", err=err), None
         else:
             urdf_path = file_path
 
@@ -356,7 +357,7 @@ class RobotLoader:
 
     def load_robot_model(self, urdf_path, context_dir=None):
         if not os.path.isfile(urdf_path):
-            return False, "Dosya bulunamadı", None
+            return False, t("msg.file_not_found"), None
             
         app_dir = os.path.dirname(os.path.abspath(__file__))
         sim_root = os.path.normpath(os.path.join(app_dir, "..", ".."))
@@ -385,7 +386,7 @@ class RobotLoader:
                     flags=p.URDF_USE_SELF_COLLISION
                 )
             except Exception as e:
-                return False, f"URDF Yükleme hatası: {e}", None
+                return False, t("msg.urdf_error", err=e), None
 
             num_joints = p.getNumJoints(self.sim_engine.robotId)
             revolute_joints = [
@@ -588,7 +589,7 @@ class RobotLoader:
                     self.sim_engine.gpu_shared_state['cam_pitch'] = -25.0
                     self.sim_engine.gpu_shared_state['grid_size'] = auto_grid_size
 
-            return True, f"Model Başarıyla Yüklendi ({len(revolute_joints)} Eksen)", {
+            return True, t("msg.model_loaded_axes", n=len(revolute_joints)), {
                 "max_span": max_span,
                 "n_joints": len(revolute_joints)
             }

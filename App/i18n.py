@@ -3,7 +3,7 @@ Yeni dil eklemek = yeni bir json dosyası. Eksik anahtar ekranda anahtarın kend
 import json
 import os
 
-LOCALE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "locales")
+LOCALE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locales")
 DEFAULT_LANGUAGE = "tr"
 
 _strings = {}

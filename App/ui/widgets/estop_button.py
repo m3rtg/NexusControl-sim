@@ -1,6 +1,6 @@
 import tkinter as tk
 from ui import theme
-from ui.i18n import t
+from i18n import t
 
 class EStopButton(tk.Canvas):
     """Mantar acil stop: sarı yaka, kırmızı kafa. Basınca E-stop tetikler; aktifken koyu ve 'AKTİF' yazar."""
