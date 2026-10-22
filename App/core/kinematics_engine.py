@@ -1,4 +1,5 @@
 import pybullet as p
+from i18n import t
 import math
 import time
 import threading
@@ -54,6 +55,9 @@ class KinematicsEngine:
         # Output artifacts
         self.pending_waypoints = []
         self.pending_waypoint_safety = []
+        self.pending_waypoint_labels = []   # arayüz için durak adları (i18n anahtarları)
+        self.last_segment_energy = []       # son tahminde segment başına enerji (J)
+        self.route_segment_energy = []      # son IK rotasının Hızlı profilde segment enerjileri
         self.time_fast = 0.0
         self.time_eco = 0.0
         self.peak_power_fast = 0.0
@@ -87,12 +91,12 @@ class KinematicsEngine:
             if self.sim_engine.obstacle_id is not None:
                 hits = [c for c in p.getContactPoints(robot, self.sim_engine.obstacle_id) if c[8] < 0.0]
                 if hits:
-                    return f"ENGELE ÇARPTI ({self.link_names.get(hits[0][3], f'Link {hits[0][3]}')})"
+                    return t("estop.obstacle", link=self.link_names.get(hits[0][3], f'Link {hits[0][3]}'))
 
             for c in p.getContactPoints(robot, robot):
                 lA, lB = c[3], c[4]
                 if lA == lB or c[8] >= 0.0 or (min(lA, lB), max(lA, lB)) in self.allowed_collision_pairs: continue
-                return f"GÖVDE ÇARPIŞMASI ({self.link_names.get(lA, f'Link {lA}')} <-> {self.link_names.get(lB, f'Link {lB}')})"
+                return t("estop.self", a=self.link_names.get(lA, f'Link {lA}'), b=self.link_names.get(lB, f'Link {lB}'))
 
             if check_floor:
                 for j_idx in self.sim_engine.revolute_joints:
@@ -101,15 +105,15 @@ class KinematicsEngine:
                     name = self.link_names.get(j_idx, f"Link {j_idx}")
                     if self.stand_half_extent_cm > 0 and abs(lx) <= self.stand_half_extent_cm and abs(ly) <= self.stand_half_extent_cm:
                         if lz < self.stand_top_cm - 0.5:
-                            return f"KAİDEYE ÇARPTI ({name})"
+                            return t("estop.stand", link=name)
                     elif lz < -1.0:
-                        return f"ZEMİNE ÇARPTI ({name})"
+                        return t("estop.floor", link=name)
         return None
 
     def calculate_fk(self):
         """Calculates Forward Kinematics and returns formatted log text."""
         with self.sim_engine.bullet_lock:
-            if self.sim_engine.robotId is None: return "Hata: Robot yüklü değil."
+            if self.sim_engine.robotId is None: return t("msg.no_robot")
             state = p.getLinkState(self.sim_engine.robotId, getattr(self.sim_engine, 'end_effector_index', 0))
             joint_states = p.getJointStates(self.sim_engine.robotId, self.sim_engine.revolute_joints)
 
@@ -128,12 +132,12 @@ class KinematicsEngine:
         n_joints = len(self.sim_engine.revolute_joints)
         prismatic = self.prismatic_joint_flags()
         fk_log = "\n\n" + "═" * 50 + "\n"
-        fk_log += "   NİHAİ UÇ İŞLEVCİ (TCP) İLERİ KİNEMATİK RAPORU\n"
+        fk_log += t("fk.title") + "\n"
         fk_log += "═" * 50 + "\n\n"
         
-        fk_log += "■ 1. MEVCUT EKLEM AÇILARI\n"
+        fk_log += t("fk.joints") + "\n"
         fk_log += " ──────────────────────────────────────────\n"
-        fk_log += "  Eksen | Derece (°) | Radyan (rad)\n" if not any(prismatic) else "  Eksen | Derece (°) / mm | Radyan (rad) / m\n"
+        fk_log += t("fk.joint_header" if not any(prismatic) else "fk.joint_header_linear") + "\n"
         fk_log += " ──────────────────────────────────────────\n"
         for i, val in enumerate(current_joints):
             if i < len(prismatic) and prismatic[i]:
@@ -142,15 +146,15 @@ class KinematicsEngine:
                 fk_log += f"   J{i+1:<3} | {math.degrees(val):>8.2f}° | {val:>8.4f}\n"
         fk_log += " ──────────────────────────────────────────\n\n"
 
-        fk_log += "■ 2. UZAYDAKİ SON KONUM (X, Y, Z)\n"
+        fk_log += t("fk.position") + "\n"
         fk_log += " ──────────────────────────────────────────\n"
-        fk_log += f"  X Ekseni (İleri/Geri)  : {T[0][3]:8.2f} cm\n"
-        fk_log += f"  Y Ekseni (Sağ/Sol)     : {T[1][3]:8.2f} cm\n"
-        fk_log += f"  Z Ekseni (Yukarı/Aşağı): {T[2][3]:8.2f} cm\n"
+        fk_log += t("fk.x", v=f"{T[0][3]:8.2f}") + "\n"
+        fk_log += t("fk.y", v=f"{T[1][3]:8.2f}") + "\n"
+        fk_log += t("fk.z", v=f"{T[2][3]:8.2f}") + "\n"
         fk_log += " ──────────────────────────────────────────\n\n"
 
-        fk_log += "■ 3. YÖNELİM VE DÖNÜŞÜM MATRİSİ (TCP Pose)\n"
-        fk_log += "  Rotasyon (X)   Rotasyon (Y)   Rotasyon (Z) | Pozisyon\n"
+        fk_log += t("fk.pose") + "\n"
+        fk_log += t("fk.pose_header") + "\n"
         fk_log += f"  [{T[0][0]:>8.3f}      {T[0][1]:>8.3f}      {T[0][2]:>8.3f}   | {T[0][3]:8.2f} ]\n"
         fk_log += f"  [{T[1][0]:>8.3f}      {T[1][1]:>8.3f}      {T[1][2]:>8.3f}   | {T[1][3]:8.2f} ]\n"
         fk_log += f"  [{T[2][0]:>8.3f}      {T[2][1]:>8.3f}      {T[2][2]:>8.3f}   | {T[2][3]:8.2f} ]\n"
@@ -178,13 +182,13 @@ class KinematicsEngine:
                         if pair not in self.allowed_collision_pairs and dist < -0.012:
                             nameA = self.link_names.get(lA, f"Link_{lA}")
                             nameB = self.link_names.get(lB, f"Link_{lB}")
-                            return False, f"Gövde Çarpışması ({nameA} <-> {nameB})"
+                            return False, t("safety.self", a=nameA, b=nameB)
 
                 # 2-3. Kaide/zemin ve engel
                 hit = self._pose_hits_environment()
                 if hit: return False, hit
 
-                return True, "Güvenli (Çarpışmasız)"
+                return True, t("safety.ok")
             finally:
                 for i, j_idx in enumerate(self.sim_engine.revolute_joints):
                     p.resetJointState(self.sim_engine.robotId, j_idx, original_states[i][0], original_states[i][1])
@@ -198,9 +202,9 @@ class KinematicsEngine:
             lx, ly, lz = ls[4][0] * 100.0, ls[4][1] * 100.0, ls[4][2] * 100.0
             if self.stand_half_extent_cm > 0 and abs(lx) <= self.stand_half_extent_cm and abs(ly) <= self.stand_half_extent_cm:
                 if lz < self.stand_top_cm:
-                    return f"Kaideye Çarpma ({self.link_names.get(j_idx, f'Link_{j_idx}')})"
+                    return t("safety.stand", link=self.link_names.get(j_idx, f'Link_{j_idx}'))
             elif lz < 2.0:
-                return f"Zemine Çarpma ({self.link_names.get(j_idx, f'Link_{j_idx}')})"
+                return t("safety.floor", link=self.link_names.get(j_idx, f'Link_{j_idx}'))
 
         if self.sim_engine.obstacle_id is not None:
             # getContactPoints son fizik adımının temaslarını verir, resetJointState ile kurulan deneme
@@ -209,7 +213,7 @@ class KinematicsEngine:
             margin = 0.01 * self.sim_engine.obstacle_scale
             pts = p.getClosestPoints(robot, self.sim_engine.obstacle_id, margin)
             if pts:
-                return f"Engelle Çarpışma ({self.link_names.get(pts[0][3], f'Link_{pts[0][3]}')})"
+                return t("safety.obstacle", link=self.link_names.get(pts[0][3], f'Link_{pts[0][3]}'))
         return None
 
     def check_path_safety(self, start, end):
@@ -217,18 +221,18 @@ class KinematicsEngine:
         Bu yol ~2°'lik adımlarla kaide/zemin/engel için örneklenir. Gövde içi çarpışma pahalı
         (Fanuc'ta ~5 ms) olduğu için sadece waypoint'lerde bakılır; çalışırken E-stop yine yakalar."""
         n = min(len(start), len(end), len(self.sim_engine.revolute_joints))
-        if n == 0: return True, "Güvenli (Çarpışmasız)"
+        if n == 0: return True, t("safety.ok")
         steps = max(1, math.ceil(max(abs(end[i] - start[i]) for i in range(n)) / math.radians(2.0)))
         with self.sim_engine.bullet_lock:
             original_states = p.getJointStates(self.sim_engine.robotId, self.sim_engine.revolute_joints)
             try:
                 for k in range(1, steps + 1):
-                    t = k / steps
+                    frac = k / steps
                     for i in range(n):
-                        p.resetJointState(self.sim_engine.robotId, self.sim_engine.revolute_joints[i], start[i] + (end[i] - start[i]) * t)
+                        p.resetJointState(self.sim_engine.robotId, self.sim_engine.revolute_joints[i], start[i] + (end[i] - start[i]) * frac)
                     hit = self._pose_hits_environment()
-                    if hit: return False, f"{hit}, rota üzerinde"
-                return True, "Güvenli (Çarpışmasız)"
+                    if hit: return False, t("safety.on_path", hit=hit)
+                return True, t("safety.ok")
             finally:
                 for i, j_idx in enumerate(self.sim_engine.revolute_joints):
                     p.resetJointState(self.sim_engine.robotId, j_idx, original_states[i][0], original_states[i][1])
@@ -247,19 +251,23 @@ class KinematicsEngine:
         için gereken eklem torkunu ters dinamikle (robot ve yük kütleleriyle) hesaplar. -> (enerji J, tepe güç W)"""
         robot, n = self.sim_engine.robotId, len(self.sim_engine.revolute_joints)
         self.last_peak_torques = [0.0] * n
+        self.last_segment_energy = []
         if robot is None or not waypoints or total_duration <= 0 or not self.telemetry.dynamics_ok: return 0.0, 0.0
         seg = total_duration / len(waypoints)
         energy, peak, prev = 0.0, 0.0, list(start)[:n]
         with self.sim_engine.bullet_lock:
             for wp in waypoints:
+                seg_energy = 0.0
                 for k in range(samples):
                     q, qd, qdd = self.profile_state(prev, wp, seg, strategy, (k + 0.5) / samples)
                     tau = self.telemetry.joint_torques(q, qd, qdd)
                     power = self.telemetry.electrical_power(qd, tau)
                     energy += power * seg / samples
+                    seg_energy += power * seg / samples
                     peak = max(peak, power)
                     self.last_peak_torques = [max(a, abs(b)) for a, b in zip(self.last_peak_torques, tau)]
                 prev = list(wp)
+                self.last_segment_energy.append(seg_energy)
         return energy, peak
 
     def calculate_ik(self, x_val, y_val, z_val, current_joint_angles):
@@ -268,12 +276,11 @@ class KinematicsEngine:
         z_cm = float(z_val) if z_val else (self.base_z_cm + 15.0)
 
         math_log = "\n\n" + "=" * 52 + "\n"
-        math_log += "=== TERS KİNEMATİK (IK) MATEMATİKSEL ÇÖZÜMÜ ===\n"
+        math_log += t("ik.title") + "\n"
 
         min_z_req = (self.stand_top_cm + 5.0) if (self.stand_half_extent_cm > 0 and abs(x_cm) <= self.stand_half_extent_cm + 5.0 and abs(y_cm) <= self.stand_half_extent_cm + 5.0) else 0.0
         if z_cm < min_z_req:
-            math_log += f">> [!] GÜVENLİK KORUMASI: Hedef Z ({z_cm:.1f} cm) zemin/kaide seviyesinin altında!\n"
-            math_log += f"    Z={min_z_req:.1f} cm güvenli yüksekliğe otomatik çekildi.\n\n"
+            math_log += t("ik.below_floor", z=f"{z_cm:.1f}", min=f"{min_z_req:.1f}") + "\n\n"
             z_cm = min_z_req
             
         x_m, y_m, z_m = x_cm / 100.0, y_cm / 100.0, z_cm / 100.0
@@ -371,13 +378,14 @@ class KinematicsEngine:
             final = solve_ik_pose([x_m, y_m, z_m])
             final_angles, final_err, final_safe, final_desc = final
             route, route_checks = [final], route_safety([final])
+            labels = ["route.target"]
 
             if self.sim_engine.obstacle_id is not None:
                 if all(ok for ok, _ in route_checks):
-                    math_log += ">> Engel algılandı; doğrudan rota engele değmiyor, kaçış gerekmedi.\n\n"
+                    math_log += t("ik.direct_clear") + "\n\n"
                 elif not final_safe:
                     # Hedef duruşun kendisi çarpışıyorsa hiçbir kaçış rotası işe yaramaz
-                    math_log += f">> [!] Engel algılandı; hedef konumda çarpışma var ({final_desc}).\n\n"
+                    math_log += t("ik.target_collides", desc=final_desc) + "\n\n"
                 else:
                     # Doğrudan rota engele değiyor: önce yukarı, engelin üstünden hedefin üstüne, sonra aşağı.
                     # Tüm rota temiz çıkana kadar irtifa artırılır (tepe + 15/30/45/60 cm, model ölçeğinde).
@@ -413,14 +421,16 @@ class KinematicsEngine:
                             candidate.append(final); checks.append((safe, desc)); ok = safe
                         if ok:
                             route, route_checks, found_z = candidate, checks, safe_z
+                            labels = (["route.up"] + [f"route.arc:{i}" for i in range(1, len(points) - 1)]
+                                      + ["route.above", "route.target"])
                             break
                     if found_z is not None:
-                        math_log += f">> OTONOM KAÇIŞ AKTİF: Engel Algılandı.\n"
-                        math_log += f">> {found_z * 100:.0f}cm irtifadan U-Dönüş rotası çizildi.\n\n"
+                        math_log += t("ik.detour", z=f"{found_z * 100:.0f}") + "\n\n"
                     else:
-                        math_log += ">> [!] Engel algılandı; çarpışmasız bir rota bulunamadı.\n\n"
+                        math_log += t("ik.no_route") + "\n\n"
 
             self.pending_waypoints = [wp[0] for wp in route]
+            self.pending_waypoint_labels = labels if len(labels) == len(route) else [f"route.step:{i + 1}" for i in range(len(route))]
             self.pending_waypoint_safety = route_checks
 
         deg_diffs = [abs(math.degrees(self.pending_waypoints[-1][i] - current_joint_angles[i])) for i in range(min(n_joints, len(current_joint_angles)))
@@ -444,41 +454,42 @@ class KinematicsEngine:
         # Enerji: rota iki hız profiliyle ters dinamikten (robot + yük kütlesi) hesaplanır
         energy_fast_joules, self.peak_power_fast = self.estimate_route_energy(current_joint_angles, self.pending_waypoints, self.time_fast, "fast")
         peak_tau_fast = list(self.last_peak_torques)
+        self.route_segment_energy = list(self.last_segment_energy)
         energy_eco_joules, self.peak_power_eco = self.estimate_route_energy(current_joint_angles, self.pending_waypoints, self.time_eco, "eco")
         peak_tau_eco = list(self.last_peak_torques)
         cost_fast_tl = energy_fast_joules / 3.6e6 * tariff
         cost_eco_tl = energy_eco_joules / 3.6e6 * tariff
 
-        math_log += f">> Adım 1: Hedef Uzay Vektörü (P_hedef)\n   P = [ {x_cm:.1f} cm, {y_cm:.1f} cm, {z_cm:.1f} cm ]^T\n\n"
-        math_log += f">> Adım 2: Jacobian Ters Matris & Açı Sınırları (Constrained IK)\n"
+        math_log += t("ik.step1", x=f"{x_cm:.1f}", y=f"{y_cm:.1f}", z=f"{z_cm:.1f}") + "\n\n"
+        math_log += t("ik.step2") + "\n"
         if final_err <= 0.03:
-            math_log += f"   Hedef Doğrulama Sapması: {final_err * 100.0:.2f} cm (Mükemmel Hassasiyet)\n\n"
+            math_log += t("ik.err_ok", cm=f"{final_err * 100.0:.2f}") + "\n\n"
         else:
-            math_log += f"   [!] Hedef Doğrulama Sapması: {final_err * 100.0:.2f} cm (Erişim sınırının dışında)\n\n"
+            math_log += t("ik.err_bad", cm=f"{final_err * 100.0:.2f}") + "\n\n"
             
-        math_log += ">> Adım 3: DİNAMİK YÖRÜNGE, MOTOR YÜKÜ VE ELEKTRİK MALİYETİ\n"
+        math_log += t("ik.step3") + "\n"
         if payload <= 0.0:
-            math_log += f"  - Uç Yükü (Payload) : 0.0 kg (Yüksüz / Nominal motor hızı ve torku)\n"
+            math_log += t("ik.payload_none") + "\n"
         else:
-            math_log += f"  - Uç Yükü (Payload) : {payload:.2f} kg (Kapasite: {rated_capacity:.1f} kg | Yük Oranı: %{load_ratio*100:.0f})\n"
-        math_log += f"  - Robot Kütlesi     : {self.telemetry.robot_mass_kg:.1f} kg ({self.telemetry.mass_source})\n"
-        math_log += f"  - Motor Verimi      : %{eff*100:.0f} | Birim Elektrik: {tariff:.2f} TL/kWh | Bekleme: {standby_total_w:.0f}W\n"
+            math_log += t("ik.payload", kg=f"{payload:.2f}", cap=f"{rated_capacity:.1f}", ratio=f"{load_ratio*100:.0f}") + "\n"
+        math_log += t("ik.robot_mass", kg=f"{self.telemetry.robot_mass_kg:.1f}", source=t(self.telemetry.mass_source)) + "\n"
+        math_log += t("ik.motor", eff=f"{eff*100:.0f}", tariff=f"{tariff:.2f}", standby=f"{standby_total_w:.0f}") + "\n"
         if self.telemetry.dynamics_ok:
-            math_log += "  - Enerji: ters dinamikten eklem torkları (yerçekimi + ivme), mekanik güç/verim + bakır kaybı + bekleme\n\n"
+            math_log += t("ik.energy_model") + "\n\n"
         else:
-            math_log += "  - [!] Bu modelde ters dinamik hesaplanamadı (URDF atalet değerleri); enerji tahmini yok\n\n"
-        math_log += " [ Strateji 1: Hızlı Rota (Trapezoidal) ]\n"
-        math_log += f"  • Tahmini Süre : {self.time_fast:.2f} sn\n"
-        math_log += f"  • Tahmini Enerji : {energy_fast_joules / 3600:.3f} Wh | Tepe Güç: {self.peak_power_fast:.0f} W\n"
-        math_log += f"  • Tahmini Maliyet : {cost_fast_tl:.5f} TL\n\n"
-        math_log += " [ Strateji 2: Ekonomik Rota (S-Eğrisi) ]\n"
-        math_log += f"  • Tahmini Süre : {self.time_eco:.2f} sn\n"
-        math_log += f"  • Tahmini Enerji : {energy_eco_joules / 3600:.3f} Wh | Tepe Güç: {self.peak_power_eco:.0f} W\n"
-        math_log += f"  • Tahmini Maliyet : {cost_eco_tl:.5f} TL\n"
+            math_log += t("ik.no_dynamics") + "\n\n"
+        math_log += t("ik.fast_header") + "\n"
+        math_log += t("ik.time", s=f"{self.time_fast:.2f}") + "\n"
+        math_log += t("ik.energy", wh=f"{energy_fast_joules / 3600:.3f}", peak=f"{self.peak_power_fast:.0f}") + "\n"
+        math_log += t("ik.cost", tl=f"{cost_fast_tl:.5f}") + "\n\n"
+        math_log += t("ik.eco_header") + "\n"
+        math_log += t("ik.time", s=f"{self.time_eco:.2f}") + "\n"
+        math_log += t("ik.energy", wh=f"{energy_eco_joules / 3600:.3f}", peak=f"{self.peak_power_eco:.0f}") + "\n"
+        math_log += t("ik.cost", tl=f"{cost_eco_tl:.5f}") + "\n"
         if cost_eco_tl < cost_fast_tl:
-            math_log += f"  >> TASARRUF FARKI : Ekonomik rota ile %{(1 - cost_eco_tl / max(1e-12, cost_fast_tl)) * 100:.1f} daha az elektrik.\n\n"
+            math_log += t("ik.saving_eco", pct=f"{(1 - cost_eco_tl / max(1e-12, cost_fast_tl)) * 100:.1f}") + "\n\n"
         else:
-            math_log += f"  >> TASARRUF FARKI : Hızlı rota %{(1 - cost_fast_tl / max(1e-12, cost_eco_tl)) * 100:.1f} daha ucuz (kısa sürede bekleme ve tutma kayıpları daha az birikir).\n\n"
+            math_log += t("ik.saving_fast", pct=f"{(1 - cost_fast_tl / max(1e-12, cost_eco_tl)) * 100:.1f}") + "\n\n"
 
         # Girilen motor verisiyle (toplam güç / eksen etiketi) tork sınırı aşılıyor mu
         torque_warnings = []
@@ -486,22 +497,22 @@ class KinematicsEngine:
             if not spec["real_limit"] or k >= len(peak_tau_fast): continue
             unit = "N" if spec["linear"] else "N·m"
             if peak_tau_eco[k] > spec["limit"]:
-                torque_warnings.append(f"  [!] J{k + 1}: iki rotada da tork yetmiyor (Eko {peak_tau_eco[k]:.2f} > sınır {spec['limit']:.2f} {unit})")
+                torque_warnings.append(t("ik.torque_both", j=k + 1, need=f"{peak_tau_eco[k]:.2f}", limit=f"{spec['limit']:.2f}", unit=unit))
             elif peak_tau_fast[k] > spec["limit"]:
-                torque_warnings.append(f"  [!] J{k + 1}: Hızlı rotada tork yetmiyor ({peak_tau_fast[k]:.2f} > {spec['limit']:.2f} {unit}), Eko yeterli")
+                torque_warnings.append(t("ik.torque_fast", j=k + 1, need=f"{peak_tau_fast[k]:.2f}", limit=f"{spec['limit']:.2f}", unit=unit))
         if torque_warnings:
-            math_log += ">> MOTOR TORK KONTROLÜ\n" + "\n".join(torque_warnings) + "\n\n"
+            math_log += t("ik.torque_section") + "\n" + "\n".join(torque_warnings) + "\n\n"
 
-        math_log += ">> Adım 4: SANAL GÜVENLİK & ÇARPIŞMA ANALİZİ\n"
+        math_log += t("ik.step4") + "\n"
         has_collision_risk = False
         collision_warning_text = ""
         for idx, (is_safe, desc) in enumerate(self.pending_waypoint_safety, 1):
             if is_safe:
-                math_log += f"  [✓] Manevra {idx}: Güvenli (Çarpışmasız rota)\n"
+                math_log += t("ik.wp_safe", n=idx) + "\n"
             else:
                 has_collision_risk = True
                 collision_warning_text = desc
-                math_log += f"  [!] UYARI Manevra {idx}: TEHLİKE -> {desc}!\n"
+                math_log += t("ik.wp_unsafe", n=idx, desc=desc) + "\n"
 
         math_log += "=" * 52 + "\n"
         return math_log, has_collision_risk, final_err, collision_warning_text
@@ -514,6 +525,14 @@ class KinematicsEngine:
             if self.show_workspace:
                 self.update_link_positions()
         return self.show_workspace
+
+    def clear_trail(self):
+        """İzi siler, iz açıksa çizmeye devam eder."""
+        with self.sim_engine.bullet_lock:
+            self.trail_segments = []
+            self.publish_trail()
+            if self.show_workspace:
+                self.update_link_positions()
 
     def publish_trail(self):
         gpu_state, gpu_lock = self.sim_engine.gpu_shared_state, self.sim_engine.gpu_state_lock

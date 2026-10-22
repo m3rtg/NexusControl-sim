@@ -1,4 +1,5 @@
 import pybullet as p
+from i18n import t
 import pybullet_data
 import threading
 import random
@@ -47,10 +48,10 @@ class SimulationEngine:
                 # Kaidenin (varsa) dışında kalsın
                 x = max(0.4 * s, self.obstacle_keep_out + hx + 0.05 * s)
                 self._place_obstacle([x, 0.0, hz], [hx, hy, hz])
-                return True, "Engel aktif edildi."
+                return True, t("msg.obstacle_on")
             else:
                 self.remove_obstacle()
-                return False, "Engel kaldirildi."
+                return False, t("msg.obstacle_off")
 
     def randomize_obstacle(self):
         with self.bullet_lock:
@@ -71,7 +72,7 @@ class SimulationEngine:
                 self._place_obstacle([x, y, hz], [hx, hy, hz])
                 if self.robotId is None or not p.getClosestPoints(self.robotId, self.obstacle_id, 0.02 * s):
                     break
-            return f"Rastgele Engel: Uzunluk {hz * 200:.0f}cm, X:{x * 100:.0f} Y:{y * 100:.0f}"
+            return t("msg.obstacle_random", h=f"{hz * 200:.0f}", x=f"{x * 100:.0f}", y=f"{y * 100:.0f}")
 
     def _place_obstacle(self, pos, half):
         if self.obstacle_id is not None:
@@ -103,7 +104,7 @@ class SimulationEngine:
                     if i < len(shared_targets):
                         shared_targets[i] = 0.0
                         
-        return "SİSTEM SIFIRLANDI. Güvenlik için engel silindi, Base'e dönüldü."
+        return t("msg.estop_reset")
 
     def step_simulation(self, targets):
         """Called periodically by the background engine thread."""

@@ -2,6 +2,7 @@ import math
 import random
 import time
 import pybullet as p
+from i18n import t
 
 # Motorun nominal torkunda bakır (I²R) kaybı, nominal mekanik gücünün bu oranı kabul edilir.
 # Duran bir kolun yük tutarken harcadığı güç bu terimden gelir (hız sıfırken |tork x hız| = 0).
@@ -73,11 +74,11 @@ class TelemetryEngine:
 
         est = mass_info.get("estimated_mass", 0.0)
         if est <= 0.0:
-            self.mass_source = "URDF"
+            self.mass_source = "mass.urdf"
         elif est >= 0.5 * self.robot_mass_default:
-            self.mass_source = "hacimden tahmini"
+            self.mass_source = "mass.estimated"
         else:
-            self.mass_source = "URDF + kısmen tahmini"
+            self.mass_source = "mass.partial"
         self.apply_mass_model()
 
     def apply_mass_model(self):
@@ -247,7 +248,7 @@ class TelemetryEngine:
             since = self._stall_since.setdefault(k, now)
             if now - since >= 0.5:
                 unit = "N" if sp["linear"] else "N·m"
-                return f"TORK YETERSİZ (J{k + 1}: gerekli > {sp['limit']:.2f} {unit})"
+                return t("estop.torque", j=k + 1, limit=f"{sp['limit']:.2f}", unit=unit)
         return None
 
     def set_playback_state(self, velocities, torques):
@@ -286,13 +287,14 @@ class TelemetryEngine:
 
         self.apply_mass_model()
 
-        return f"Yük: {self.payload_kg:.2f} kg | Robot: {self.robot_mass_kg:.1f} kg | Verim: %{self.motor_efficiency*100:.0f} | Tarife: {self.electricity_rate:.2f} TL/kWh"
+        return t("msg.energy_applied", payload=f"{self.payload_kg:.2f}", robot=f"{self.robot_mass_kg:.1f}",
+                 eff=f"{self.motor_efficiency*100:.0f}", tariff=f"{self.electricity_rate:.2f}")
 
     def reset_energy_counter(self):
         self.cumulative_energy_joules = 0.0
         self.cumulative_energy_kwh = 0.0
         self.cumulative_cost_tl = 0.0
-        return "Enerji ve maliyet sayacı sıfırlandı."
+        return t("msg.counter_reset")
 
     def calculate_power_tick(self, dt):
         """Called periodically by the background engine thread to calculate physics energy consumption"""
@@ -300,7 +302,10 @@ class TelemetryEngine:
             if self.sim_engine.robotId is None: return
 
             playback = self._playback
-            if playback is not None and time.perf_counter() - playback[0] < 0.2:
+            if self.sim_engine.e_stop_active:
+                # Motorlar kilitli, fizik adımlanmıyor: sadece bekleme gücü (eskiden son değer donup kalıyordu)
+                velocities = torques = [0.0] * len(self.sim_engine.revolute_joints)
+            elif playback is not None and time.perf_counter() - playback[0] < 0.2:
                 velocities, torques = playback[1], playback[2]
             else:
                 joint_states = p.getJointStates(self.sim_engine.robotId, self.sim_engine.revolute_joints)

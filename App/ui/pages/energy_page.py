@@ -1,96 +1,88 @@
 import customtkinter as ctk
 import pybullet as p
+from ui import theme
+from i18n import t
 
-MOTOR_SOURCES = {"Otomatik": "auto", "Toplam Güç": "total", "Eksen Etiketleri": "labels"}
+SOURCE_KEYS = ("auto", "total", "labels")
 
 class EnergyPage(ctk.CTkScrollableFrame):
+    """Yük, robot ağırlığı, tarife, verim, bekleme gücü ve motor verisi kaynağı (otomatik / toplam güç / eksen etiketleri)."""
     def __init__(self, parent, app, telemetry_engine, sim_engine):
-        super().__init__(parent, fg_color="transparent")
-
-        self.app = app
-        self.telemetry = telemetry_engine
-        self.sim_engine = sim_engine
+        super().__init__(parent, fg_color="transparent", scrollbar_button_color=theme.BORDER2,
+                         scrollbar_button_hover_color=theme.MUTED)
+        self.app, self.telemetry, self.sim_engine = app, telemetry_engine, sim_engine
         self.axis_rows = []
+        self._source_labels = {k: t(f"energy.src_{k}") for k in SOURCE_KEYS}
+        self._source_by_label = {v: k for k, v in self._source_labels.items()}
 
-        ctk.CTkLabel(self, text="Güç ve Enerji", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(10, 12))
+        theme.section(self, t("energy.section"), t("energy.title")).pack(fill="x", pady=(0, 10))
 
-        # --- YÜK, ROBOT VE TARİFE ---
-        card = self._card("⚙️ YÜK VE TARİFE")
-        grid = ctk.CTkFrame(card, fg_color="transparent")
-        grid.pack(fill="x", padx=15, pady=(2, 4))
-        grid.grid_columnconfigure((0, 1), weight=1)
-        self.entry_payload = self._field(grid, 0, 0, "Yük (Payload - kg):", "0.0")
-        self.entry_robot_mass = self._field(grid, 0, 1, "Robot Ağırlığı (kg):", "")
-        self.entry_tariff = self._field(grid, 1, 0, "Tarife (TL / kWh):", "4.50")
-        self.entry_efficiency = self._field(grid, 1, 1, "Sürücü/Dişli Verimi (%):", "85")
-        self.entry_standby = self._field(grid, 2, 0, "Bekleme Gücü (W / eksen):", "15")
-        self.lbl_mass_source = ctk.CTkLabel(card, text="", font=ctk.CTkFont(size=10), text_color="#777777")
-        self.lbl_mass_source.pack(padx=15, pady=(0, 8), anchor="w")
+        # --- yük ve tarife ---
+        box = self._box(t("energy.load_section"))
+        grid = ctk.CTkFrame(box, fg_color="transparent")
+        grid.pack(fill="x", padx=12, pady=(0, 4))
+        grid.grid_columnconfigure((0, 1), weight=1, uniform="energy")
+        self.entry_payload = self._field(grid, 0, 0, t("energy.payload"), "0.0")
+        self.entry_robot_mass = self._field(grid, 0, 1, t("energy.robot_mass"), "")
+        self.entry_tariff = self._field(grid, 1, 0, t("energy.tariff"), "4.50")
+        self.entry_efficiency = self._field(grid, 1, 1, t("energy.efficiency"), "85")
+        self.entry_standby = self._field(grid, 2, 0, t("energy.standby"), "15")
+        self.lbl_mass_source = ctk.CTkLabel(box, text="", font=theme.font(10), text_color=theme.MUTED, anchor="w")
+        self.lbl_mass_source.pack(fill="x", padx=12, pady=(0, 10))
 
-        # --- MOTOR VERİSİ ---
-        card = self._card("🔌 MOTOR VERİSİ")
-        self.source_selector = ctk.CTkSegmentedButton(card, values=list(MOTOR_SOURCES), command=self._on_source_changed)
-        self.source_selector.set("Otomatik")
-        self.source_selector.pack(fill="x", padx=15, pady=(2, 6))
-        self.lbl_source_info = ctk.CTkLabel(card, text="", font=ctk.CTkFont(size=10), text_color="#AAAAAA", justify="left", anchor="w", wraplength=300)
-        self.lbl_source_info.pack(fill="x", padx=15, pady=(0, 6))
+        # --- motor verisi ---
+        box = self._box(t("energy.motor_section"))
+        self.source_selector = theme.segmented(box, list(self._source_labels.values()), command=self._on_source_changed)
+        self.source_selector.set(self._source_labels["auto"])
+        self.source_selector.pack(fill="x", padx=12, pady=(0, 6))
+        self.lbl_source_info = ctk.CTkLabel(box, text="", font=theme.font(10), text_color=theme.FG2, justify="left",
+                                            anchor="w", wraplength=280)
+        self.lbl_source_info.pack(fill="x", padx=12, pady=(0, 8))
 
-        # Toplam güç
-        self.total_frame = ctk.CTkFrame(card, fg_color="transparent")
-        self.entry_total_power = self._field(self.total_frame, 0, 0, "Robotun Nominal Gücü (W):", "")
+        self.total_frame = ctk.CTkFrame(box, fg_color="transparent")
         self.total_frame.grid_columnconfigure(0, weight=1)
+        self.entry_total_power = self._field(self.total_frame, 0, 0, t("energy.total_power"), "")
 
-        # Eksen etiketleri: Tip | Güç (W) | Tork (kg·cm) | Dişli (1:x)
-        self.labels_frame = ctk.CTkFrame(card, fg_color="transparent")
+        self.labels_frame = ctk.CTkFrame(box, fg_color="transparent")
         header = ctk.CTkFrame(self.labels_frame, fg_color="transparent")
         header.pack(fill="x")
-        for col, (text, w) in enumerate([("Eksen", 34), ("Tip", 76), ("Güç W", 56), ("Tork kg·cm", 64), ("Dişli 1:x", 56)]):
-            ctk.CTkLabel(header, text=text, width=w, font=ctk.CTkFont(size=10), text_color="#AAAAAA").grid(row=0, column=col, padx=1)
+        for col, (key, w) in enumerate((("energy.col_axis", 30), ("energy.col_type", 70), ("energy.col_power", 52),
+                                        ("energy.col_torque", 60), ("energy.col_gear", 52))):
+            ctk.CTkLabel(header, text=t(key), width=w, font=theme.font(9), text_color=theme.MUTED, height=14).grid(row=0, column=col, padx=1)
         self.rows_frame = ctk.CTkFrame(self.labels_frame, fg_color="transparent")
         self.rows_frame.pack(fill="x")
-        ctk.CTkButton(self.labels_frame, text="1. satırı tüm eksenlere kopyala", height=26, fg_color="#2A2A2A",
-                      command=self._copy_first_row).pack(fill="x", pady=(6, 0))
+        theme.button(self.labels_frame, t("energy.copy_first"), self._copy_first_row, kind="ghost", height=26,
+                     font=theme.font(10)).pack(fill="x", pady=(6, 0))
 
-        ctk.CTkButton(self, text="⚡ Uygula", height=38, corner_radius=8, fg_color="#332B10", hover_color="#4A3E14",
-                      text_color="#FFD700", font=ctk.CTkFont(size=12, weight="bold"),
-                      command=self.app.apply_energy_settings).pack(fill="x", pady=(4, 10))
+        theme.button(self, t("energy.apply"), self.app.apply_energy_settings, kind="primary", height=36).pack(fill="x", pady=(2, 8))
+        self.lbl_motor_summary = ctk.CTkLabel(self, text="", font=theme.font(10, mono=True), text_color=theme.FG2,
+                                              justify="left", anchor="w")
+        self.lbl_motor_summary.pack(fill="x", pady=(0, 6))
+        self._on_source_changed(self._source_labels["auto"])
 
-        self.lbl_motor_summary = ctk.CTkLabel(self, text="", font=ctk.CTkFont(family="Consolas", size=10), text_color="#AAAAAA", justify="left", anchor="w")
-        self.lbl_motor_summary.pack(fill="x", padx=5, pady=(0, 10))
-
-        self._on_source_changed("Otomatik")
-
-    def _card(self, title):
-        card = ctk.CTkFrame(self, fg_color="#242424", corner_radius=10)
-        card.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(card, text=title, font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color="#FFB300").pack(pady=(8, 4), padx=15, anchor="w")
-        return card
+    def _box(self, title):
+        box = ctk.CTkFrame(self, fg_color=theme.BG, corner_radius=theme.RADIUS_SM + 2, border_width=1, border_color=theme.BORDER)
+        box.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(box, text=title, font=theme.font(11, "bold"), text_color=theme.GOLD, anchor="w").pack(fill="x", padx=12, pady=(8, 4))
+        return box
 
     @staticmethod
     def _field(parent, row, col, label, default):
         cell = ctk.CTkFrame(parent, fg_color="transparent")
-        cell.grid(row=row, column=col, sticky="ew", padx=(0, 5) if col == 0 else (5, 0), pady=2)
-        ctk.CTkLabel(cell, text=label, font=ctk.CTkFont(size=11), text_color="#AAAAAA").pack(anchor="w")
-        entry = ctk.CTkEntry(cell, height=30)
-        entry.insert(0, default)
-        entry.pack(fill="x", pady=(2, 0))
-        return entry
+        cell.grid(row=row, column=col, sticky="ew", padx=(0, 4) if col == 0 else (4, 0), pady=2)
+        ctk.CTkLabel(cell, text=label, font=theme.font(10), text_color=theme.MUTED, anchor="w", height=14).pack(fill="x")
+        e = theme.entry(cell, height=28)
+        e.insert(0, default)
+        e.pack(fill="x")
+        return e
 
-    def _on_source_changed(self, value):
-        mode = MOTOR_SOURCES[value]
+    def _on_source_changed(self, label):
+        mode = self._source_by_label[label]
         self.total_frame.pack_forget()
         self.labels_frame.pack_forget()
-        if mode == "auto":
-            self.lbl_source_info.configure(text="Motorlar robotun ağırlığından boyutlandırılır: her eksen kendi yerçekimi "
-                                                "yükünün 2 katına göre, servo kabul edilir.")
-        elif mode == "total":
-            self.lbl_source_info.configure(text="Robotun etiket/katalog gücü eksenlere yük oranında dağıtılır (servo). "
-                                                "Tork sınırı bu güçten çıkar.")
-            self.total_frame.pack(fill="x", padx=15, pady=(0, 10))
-        else:
-            self.lbl_source_info.configure(text="Her eksenin motor etiketi. Step motor sürücüsü yükten bağımsız sabit akım "
-                                                "çeker (etiketteki W); tork sınırı = tutma torku x dişli oranı.")
-            self.labels_frame.pack(fill="x", padx=15, pady=(0, 10))
+        self.lbl_source_info.configure(text=t(f"energy.src_{mode}_info"))
+        if mode == "total": self.total_frame.pack(fill="x", padx=12, pady=(0, 10))
+        elif mode == "labels": self.labels_frame.pack(fill="x", padx=12, pady=(0, 10))
 
     def rebuild_axis_rows(self):
         """Model yüklenince eksen sayısı kadar satır; önceki değerler aynı sıradaki eksenlerde korunur."""
@@ -102,12 +94,12 @@ class EnergyPage(ctk.CTkScrollableFrame):
             linear = robot is not None and p.getJointInfo(robot, j_idx)[2] == p.JOINT_PRISMATIC
             row = ctk.CTkFrame(self.rows_frame, fg_color="transparent")
             row.pack(fill="x", pady=1)
-            ctk.CTkLabel(row, text=f"J{i + 1}", width=34, font=ctk.CTkFont(size=11)).grid(row=0, column=0, padx=1)
-            kind = ctk.CTkOptionMenu(row, values=["Servo", "Step"], width=76, height=26)
+            ctk.CTkLabel(row, text=f"J{i + 1}", width=30, font=theme.font(10, "bold"), text_color=theme.MUTED).grid(row=0, column=0, padx=1)
+            kind = theme.option_menu(row, ["Servo", "Step"], width=70, height=24)
             kind.grid(row=0, column=1, padx=1)
             entries = []
-            for col, w in ((2, 56), (3, 64), (4, 56)):
-                e = ctk.CTkEntry(row, width=w, height=26, placeholder_text="kg" if (linear and col == 3) else "")
+            for col, w in ((2, 52), (3, 60), (4, 52)):
+                e = theme.entry(row, width=w, height=24, font=theme.font(10), placeholder_text="kg" if (linear and col == 3) else "")
                 e.grid(row=0, column=col, padx=1)
                 entries.append(e)
             entries[2].insert(0, "1")
@@ -131,20 +123,24 @@ class EnergyPage(ctk.CTkScrollableFrame):
         first = self._read_row(self.axis_rows[0])
         for r in self.axis_rows[1:]: self._write_row(r, first)
 
+    def select_source(self, mode):
+        label = self._source_labels[mode]
+        self.source_selector.set(label)
+        self._on_source_changed(label)
+
     def motor_settings(self):
         """Ham alan değerleri; TelemetryEngine.apply_motor_settings ayrıştırır."""
         return {
-            "mode": MOTOR_SOURCES[self.source_selector.get()],
+            "mode": self._source_by_label[self.source_selector.get()],
             "total_power": self.entry_total_power.get(),
             "standby": self.entry_standby.get(),
             "axes": [dict(self._read_row(r), linear=r["linear"]) for r in self.axis_rows],
         }
 
     def show_motor_summary(self):
-        tel = self.telemetry
-        lines = [f"{'Eksen':<6}{'Tip':<7}{'Tork sınırı':>13}{'Sabit/Bakır':>14}"]
-        for i, m in enumerate(tel.motor_specs):
+        lines = [t("energy.summary_header")]
+        for i, m in enumerate(self.telemetry.motor_specs):
             unit = "N" if m.get("linear") else "N·m"
             loss = f"{m['constant_w']:.1f} W" if m["kind"] == "stepper" else f"k={m['copper_k']:.4f}"
-            lines.append(f"J{i + 1:<5}{'Step' if m['kind'] == 'stepper' else 'Servo':<7}{m['limit']:>9.1f} {unit:<3}{loss:>14}")
+            lines.append(f"J{i + 1:<5}{'Step' if m['kind'] == 'stepper' else 'Servo':<7}{m['limit']:>9.1f} {unit:<4}{loss:>12}")
         self.lbl_motor_summary.configure(text="\n".join(lines))
