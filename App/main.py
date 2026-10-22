@@ -277,10 +277,12 @@ class RobotKontrolApp(ctk.CTk):
 
     def run_trajectory_thread(self, strategy, waypoints, start_angles, total_duration):
         num_waypoints = len(waypoints)
-        duration_per_wp = total_duration / num_waypoints
+        # Tek süre verilirse segmentlere eşit bölünür; liste verilirse her segmentin kendi süresi
+        durations = total_duration if isinstance(total_duration, list) else [total_duration / num_waypoints] * num_waypoints
         current = start_angles
 
         for wp_idx, target_angles in enumerate(waypoints):
+            duration_per_wp = durations[wp_idx]
             steps = int(max(duration_per_wp * 30, 5))
             self.kinematics_engine.update_link_positions()
 
@@ -310,25 +312,53 @@ class RobotKontrolApp(ctk.CTk):
         # Tk thread-safe değil: kayıt ve buton güncellemesi update_ui_loop'ta (ana thread) yapılır
         self.trajectory_finished = True
 
-    def go_to_ik_step(self, angles):
+    def route_position(self, angles, waypoints):
+        """Robot rotadaki bir waypoint'te duruyorsa onun indeksi, değilse None. Sadece TCP zincirindeki
+        eklemlere bakılır; gripper parmakları IK'dan sonra değişmiş olabilir."""
+        chain = self.kinematics_engine.ee_chain_joints()
+        cols = [k for k, j in enumerate(self.sim_engine.revolute_joints) if j in chain and k < len(angles)]
+        for idx, wp in enumerate(waypoints):
+            if all(abs(angles[k] - wp[k]) < 1e-3 for k in cols if k < len(wp)):
+                return idx
+        return None
+
+    def go_to_ik_step(self, target_idx):
+        waypoints = self.kinematics_engine.pending_waypoints
+        if not 0 <= target_idx < len(waypoints): return
         with self.data_lock:
             current = list(self.shared_targets)
 
-        # Duruşun kendisi ve şu anki konumdan oraya giden yol (ör. doğrudan Manevra 3'e atlamak
-        # aradaki kaçış noktalarını atlar ve engelin içinden geçebilir)
-        is_safe, desc = self.kinematics_engine.check_angles_safety(angles)
-        if is_safe:
-            is_safe, desc = self.kinematics_engine.check_path_safety(current, angles)
-        if not is_safe:
-            messagebox.showwarning("Çarpışma Engeli", f"Bu konuma gidilemez:\n{desc}")
-            self.status_message = f"UYARI: {desc}! Hareket iptal edildi."
+        # Aradaki manevralar engel kaçışının parçası olabilir, atlanmaz: robot rotada bir noktadaysa oradan,
+        # değilse baştan başlayarak hedefe kadar sırayla oynatılır (hedef gerideyse ters sırayla).
+        at = self.route_position(current, waypoints)
+        if at == target_idx:
+            self.status_message = f"Robot zaten Manevra {target_idx + 1} konumunda."
             return
+        if at is None:
+            sequence = list(range(0, target_idx + 1))
+        elif at < target_idx:
+            sequence = list(range(at + 1, target_idx + 1))
+        else:
+            sequence = list(range(at - 1, target_idx - 1, -1))
 
-        # Işınlamak yerine Eko rotanın S-eğrisiyle oraya gider; süre Eko rota tahminiyle aynı ölçekte
+        # Duruşlar ve aradaki yollar tıklama anında tekrar kontrol edilir (engel IK'dan sonra değişmiş olabilir)
         prismatic = self.kinematics_engine.prismatic_joint_flags()
-        max_deg = max([abs(math.degrees(a - c)) for a, c, lin in zip(angles, current, prismatic) if not lin] or [0.0])
-        duration = max(0.5, max_deg / 100.0) * 1.8
-        self.start_trajectory("eco", [angles], duration, "Manevra konumuna gidiliyor...")
+        steps, durations, prev = [], [], current
+        for idx in sequence:
+            wp = waypoints[idx]
+            is_safe, desc = self.kinematics_engine.check_angles_safety(wp)
+            if is_safe:
+                is_safe, desc = self.kinematics_engine.check_path_safety(prev, wp)
+            if not is_safe:
+                messagebox.showwarning("Çarpışma Engeli", f"Manevra {idx + 1} konumuna gidilemez:\n{desc}")
+                self.status_message = f"UYARI: Manevra {idx + 1}: {desc}! Hareket iptal edildi."
+                return
+            # Her segment Eko rotanın S-eğrisi ve süre ölçeğiyle
+            max_deg = max([abs(math.degrees(a - c)) for a, c, lin in zip(wp, prev, prismatic) if not lin] or [0.0])
+            steps.append(wp); durations.append(max(0.5, max_deg / 100.0) * 1.8); prev = wp
+
+        label = f"Manevra {sequence[0] + 1}" if len(sequence) == 1 else f"Manevra {sequence[0] + 1} → {sequence[-1] + 1}"
+        self.start_trajectory("eco", steps, durations, f"{label} oynatılıyor...")
 
     def make_scroll_smooth(self, scrollable_frame, step_px=50):
         def _on_wheel(event):

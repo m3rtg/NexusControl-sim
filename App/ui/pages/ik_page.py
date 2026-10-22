@@ -161,7 +161,7 @@ class IKPage(ctk.CTkScrollableFrame):
             btn_color = "#005A9E" if btn_state == "normal" else "#555555"
             btn_text = f"Manevra {step_num} Konumuna Git" if wp_safe else f"Manevra {step_num} (Kilitli: {wp_desc})"
             btn = ctk.CTkButton(self.ik_steps_frame, text=btn_text, corner_radius=6,
-                                command=lambda w=wp: self.app.go_to_ik_step(w),
+                                command=lambda idx=step_num - 1: self.app.go_to_ik_step(idx),
                                 state=btn_state,
                                 fg_color=btn_color,
                                 hover_color="#003A68")
