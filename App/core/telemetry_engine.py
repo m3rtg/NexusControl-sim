@@ -6,6 +6,17 @@ import pybullet as p
 # Motorun nominal torkunda bakır (I²R) kaybı, nominal mekanik gücünün bu oranı kabul edilir.
 # Duran bir kolun yük tutarken harcadığı güç bu terimden gelir (hız sıfırken |tork x hız| = 0).
 COPPER_LOSS_AT_RATED = 0.15
+# Servo motorlar kısa süre nominal torkunun bu katını verebilir (tepe tork)
+SERVO_PEAK_FACTOR = 3.0
+KGCM_TO_NM = 0.0980665
+KG_TO_N = 9.80665
+
+def _parse_float(text, default=None):
+    try:
+        v = float(str(text).strip().replace(',', '.'))
+        return v if v > 0 else default
+    except Exception:
+        return default
 
 class TelemetryEngine:
     def __init__(self, sim_engine):
@@ -23,6 +34,12 @@ class TelemetryEngine:
         self._base_dynamics = {}   # link -> (kütle, atalet köşegeni)
         self._root_mass = 0.0
         self.copper_k = []         # eklem başına bakır kaybı katsayısı, W / (Nm)²
+        # Motor verisi kaynağı: "auto" (ağırlıktan), "total" (robotun toplam gücü), "labels" (eksen etiketleri)
+        self.motor_mode = "auto"
+        self.total_rated_w = 0.0
+        self.axis_labels = []
+        self.motor_specs = []      # eksen başına: tip, tork sınırı, bakır katsayısı, sabit güç, gerçek sınır mı
+        self._stall_since = {}
         self.dynamics_ok = False   # ters dinamik hesaplanabiliyor mu (bazı URDF ataletlerini Bullet reddeder)
         self._ee_local = [0.0, 0.0, 0.0]
         self._playback = None      # (zaman, hızlar, torklar): IK oynatılırken fizik yerine ters dinamikten
@@ -103,10 +120,32 @@ class TelemetryEngine:
             tau = [t + sum(lin[r][k] * force[r] for r in range(3)) for k, t in enumerate(tau)]
         return tau
 
+    def apply_motor_settings(self, settings):
+        """Güç ve Enerji sayfasındaki motor verisi; bir sonraki apply_mass_model/calibrate_motors'ta kullanılır."""
+        self.motor_mode = settings.get("mode", "auto")
+        self.total_rated_w = _parse_float(settings.get("total_power"), 0.0)
+        try:
+            standby = str(settings.get("standby", "")).strip().replace(',', '.')
+            self.motor_standby_w = max(0.0, float(standby)) if standby else 15.0
+        except Exception:
+            self.motor_standby_w = 15.0
+        self.axis_labels = []
+        for ax in settings.get("axes", []):
+            torque = _parse_float(ax.get("torque"))
+            if torque is not None:
+                torque *= KG_TO_N if ax.get("linear") else KGCM_TO_NM
+            self.axis_labels.append({
+                "kind": "stepper" if ax.get("kind") == "Step" else "servo",
+                "power": _parse_float(ax.get("power")),
+                "torque": torque,                          # motor milinde, N·m (lineer eksende N)
+                "gear": _parse_float(ax.get("gear"), 1.0),
+            })
+
     def calibrate_motors(self):
         """Her eklem için referans tork: rastgele duruşlarda yerçekimi torkunun en büyüğünün 2 katı.
-        Bakır kaybı katsayısı k = COPPER_LOSS_AT_RATED x maks. hız / referans tork: referans torkta tutmak,
-        referans tork x maks. hız mekanik gücünün %15'i kadar elektrik çeker. Motor tork sınırı da buradan."""
+        Otomatik modda motor bundan boyutlanır; bakır kaybı katsayısı k = COPPER_LOSS_AT_RATED x nominal güç /
+        nominal tork²: nominal torkta tutmak nominal gücün %15'i kadar elektrik çeker. Toplam güç ve eksen
+        etiketi modlarında nominal güç/tork kullanıcının girdiği değerlerden gelir."""
         robot, joints = self.sim_engine.robotId, self.sim_engine.revolute_joints
         n = len(joints)
         if robot is None or n == 0: return
@@ -130,24 +169,86 @@ class TelemetryEngine:
             print(f"[Dinamik] Ters dinamik hesaplanamadı, URDF atalet değerlerini kontrol edin: {e}")
             self.dynamics_ok = False
             self.copper_k = []
+            self.motor_specs = []
             self.sim_engine.motor_forces = []
             return
         tau_ref = [2.0 * g for g in gravity]
         # Dikey eksenli J1 gibi yerçekimi torku ~0 olan eklemler de gerçekte boyutlu bir motor taşır
         floor = max(0.5, 0.1 * max(tau_ref))
         tau_ref = [max(t, floor) for t in tau_ref]
-        self.copper_k = [COPPER_LOSS_AT_RATED * w / t for w, t in zip(w_max, tau_ref)]
-        # Ağır robotlar sabit 800 Nm ile kendi ağırlığını taşıyamaz; hiçbir eklem eskisinden zayıf olmaz
-        self.sim_engine.motor_forces = [max(800.0, 3.0 * t) for t in tau_ref]
+        linear = [p.getJointInfo(robot, j)[2] == p.JOINT_PRISMATIC for j in joints]
+
+        def servo(k, power, tau_rated, real):
+            return {"kind": "servo", "limit": SERVO_PEAK_FACTOR * tau_rated, "copper_k": COPPER_LOSS_AT_RATED * power / tau_rated ** 2,
+                    "constant_w": 0.0, "real_limit": real, "linear": linear[k]}
+
+        def auto(k):
+            # Ağır robotlar sabit 800 Nm ile kendi ağırlığını taşıyamaz; hiçbir eklem eskisinden zayıf olmaz
+            spec = servo(k, tau_ref[k] * w_max[k], tau_ref[k], False)
+            spec["limit"] = max(800.0, spec["limit"])
+            return spec
+
+        specs = []
+        if self.motor_mode == "total" and self.total_rated_w > 0:
+            # Toplam güç, eksenlere gereken güç (referans tork x maks. hız) oranında dağıtılır
+            weights = [t * w for t, w in zip(tau_ref, w_max)]
+            for k in range(n):
+                power = self.total_rated_w * weights[k] / sum(weights)
+                specs.append(servo(k, power, power / w_max[k], True))
+        elif self.motor_mode == "labels":
+            for k in range(n):
+                ax = self.axis_labels[k] if k < len(self.axis_labels) else None
+                if ax is None or (ax["power"] is None and ax["torque"] is None):
+                    specs.append(auto(k)); continue
+                tau_joint = ax["torque"] * ax["gear"] if ax["torque"] is not None else None
+                if ax["kind"] == "stepper":
+                    # Step sürücüsü yükten bağımsız sabit akım verir: etiketteki güç sürekli harcanır,
+                    # tutma torku aşılırsa motor adım kaçırır (fizikte tork sınırı)
+                    specs.append({"kind": "stepper", "limit": tau_joint if tau_joint else tau_ref[k], "copper_k": 0.0,
+                                  "constant_w": ax["power"] or 0.0, "real_limit": tau_joint is not None, "linear": linear[k]})
+                else:
+                    power = ax["power"] if ax["power"] is not None else tau_joint * w_max[k]
+                    tau_rated = tau_joint if tau_joint is not None else power / w_max[k]
+                    specs.append(servo(k, power, tau_rated, True))
+        else:
+            specs = [auto(k) for k in range(n)]
+
+        self.motor_specs = specs
+        self.copper_k = [sp["copper_k"] for sp in specs]
+        self.sim_engine.motor_forces = [sp["limit"] for sp in specs]
+        self._stall_since = {}
 
     def electrical_power(self, velocities, torques):
-        """Mekanik güç / verim + bakır kaybı (k x tork²) + bekleme gücü."""
+        """Mekanik güç / verim + servo bakır kaybı (k x tork²) veya step motor sabit gücü + bekleme gücü."""
         eff = max(0.2, self.motor_efficiency)
         power = 0.0
         for k, (w, t) in enumerate(zip(velocities, torques)):
-            c = self.copper_k[k] if k < len(self.copper_k) else 0.0
-            power += abs(w * t) / eff + c * t * t
+            spec = self.motor_specs[k] if k < len(self.motor_specs) else None
+            power += abs(w * t) / eff
+            if spec is None: continue
+            power += spec["constant_w"] if spec["kind"] == "stepper" else spec["copper_k"] * t * t
         return power + self.motor_standby_w * len(self.sim_engine.revolute_joints)
+
+    def detect_overload(self, targets):
+        """Gerçek tork sınırı girilmiş eksenlerde (toplam güç / etiket) motor sınırda, eksen hareket etmiyor ve
+        hedefinden uzaksa 0.5 sn sonra açıklama döner (step motor adım kaçırır, servo aşırı yük alarmı verir).
+        Slider sıçramalarında motor kısa süre sınıra dayanır ama hareket ettiği için tetiklenmez."""
+        specs = self.motor_specs
+        if not any(sp["real_limit"] for sp in specs): return None
+        now = time.perf_counter()
+        with self.sim_engine.bullet_lock:
+            states = p.getJointStates(self.sim_engine.robotId, self.sim_engine.revolute_joints)
+        for k, (sp, st) in enumerate(zip(specs, states)):
+            if not sp["real_limit"] or k >= len(targets): continue
+            far = abs(targets[k] - st[0]) > (0.005 if sp["linear"] else math.radians(2))
+            stalled = abs(st[3]) >= 0.97 * sp["limit"] and abs(st[1]) < 0.05 and far
+            if not stalled:
+                self._stall_since.pop(k, None); continue
+            since = self._stall_since.setdefault(k, now)
+            if now - since >= 0.5:
+                unit = "N" if sp["linear"] else "N·m"
+                return f"TORK YETERSİZ (J{k + 1}: gerekli > {sp['limit']:.2f} {unit})"
+        return None
 
     def set_playback_state(self, velocities, torques):
         # IK oynatıcısı eklemleri doğrudan konumlar; fizik hız/tork görmez. Ters dinamikten gelen değerler

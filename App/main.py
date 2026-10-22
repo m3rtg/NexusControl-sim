@@ -19,6 +19,7 @@ from core.robot_loader import RobotLoader
 from ui.pages.manual_page import ManualPage
 from ui.pages.fk_page import FKPage
 from ui.pages.ik_page import IKPage
+from ui.pages.energy_page import EnergyPage
 from ui.widgets.analysis_panel import AnalysisPanel
 from render_engine import RobotGPURenderer
 
@@ -107,7 +108,7 @@ class RobotKontrolApp(ctk.CTk):
         self.grid_columnconfigure(3, weight=4, minsize=320)
 
         # 1. NAVBAR
-        # Kaydırılabilir: Yük ve Enerji kartıyla içerik ~815 px; küçük ekranlarda/ölçeklemede alt kısım kesilmesin
+        # Kaydırılabilir: içerik ~690 px; küçük ekranlarda/ölçeklemede alt kısım kesilmesin
         self.sidebar = ctk.CTkScrollableFrame(self, corner_radius=0, fg_color="#141414",
                                               scrollbar_button_color="#2A2A2A", scrollbar_button_hover_color="#3A3A3A")
         self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
@@ -120,6 +121,7 @@ class RobotKontrolApp(ctk.CTk):
         ctk.CTkButton(self.sidebar, text="Manuel Kontrol", height=40, command=lambda: self.show_page("manual")).pack(pady=8, padx=10, fill="x")
         ctk.CTkButton(self.sidebar, text="İleri Kinematik", height=40, command=lambda: self.show_page("fk")).pack(pady=8, padx=10, fill="x")
         ctk.CTkButton(self.sidebar, text="Ters Kinematik", height=40, command=lambda: self.show_page("ik")).pack(pady=8, padx=10, fill="x")
+        ctk.CTkButton(self.sidebar, text="Güç ve Enerji", height=40, command=lambda: self.show_page("energy")).pack(pady=8, padx=10, fill="x")
         
         self.btn_nav_workspace = ctk.CTkButton(self.sidebar, text="Saydam İzi Göster", height=40, fg_color="#005A9E", command=self.toggle_workspace)
         self.btn_nav_workspace.pack(pady=(20, 8), padx=10, fill="x")
@@ -132,31 +134,6 @@ class RobotKontrolApp(ctk.CTk):
         ctk.CTkButton(obs_frame, text="Rastgele", height=40, fg_color="#555555", command=self.randomize_obstacle).grid(row=0, column=1, sticky="ew")
 
         ctk.CTkButton(self.sidebar, text="E-STOP SIFIRLA", height=40, fg_color="#8B0000", command=self.reset_estop).pack(pady=(20, 8), padx=10, fill="x")
-
-        # Yük ve Enerji Ayarları (IK sayfasından taşındı; tüm sayfalarda geçerli)
-        energy_card = ctk.CTkFrame(self.sidebar, fg_color="#1E1E1E", corner_radius=8)
-        energy_card.pack(pady=(10, 6), padx=10, fill="x")
-        ctk.CTkLabel(energy_card, text="⚙️ YÜK VE ENERJİ", font=ctk.CTkFont(size=11, weight="bold"), text_color="#FFB300").pack(pady=(6, 2), padx=8, anchor="w")
-        grid = ctk.CTkFrame(energy_card, fg_color="transparent")
-        grid.pack(fill="x", padx=8)
-        grid.grid_columnconfigure(0, weight=1)
-        grid.grid_columnconfigure(1, weight=1)
-        def field(row, col, label, default):
-            cell = ctk.CTkFrame(grid, fg_color="transparent")
-            cell.grid(row=row, column=col, sticky="ew", padx=(0, 3) if col == 0 else (3, 0), pady=1)
-            ctk.CTkLabel(cell, text=label, font=ctk.CTkFont(size=10), text_color="#AAAAAA", height=14).pack(anchor="w")
-            entry = ctk.CTkEntry(cell, height=26, font=ctk.CTkFont(size=11))
-            entry.insert(0, default)
-            entry.pack(fill="x")
-            return entry
-        self.entry_payload = field(0, 0, "Yük (kg)", "0.0")
-        self.entry_robot_mass = field(0, 1, "Robot (kg)", "")
-        self.entry_tariff = field(1, 0, "TL / kWh", "4.50")
-        self.entry_efficiency = field(1, 1, "Verim (%)", "85")
-        self.lbl_mass_source = ctk.CTkLabel(energy_card, text="", font=ctk.CTkFont(size=9), text_color="#777777", height=12)
-        self.lbl_mass_source.pack(padx=8, anchor="w")
-        ctk.CTkButton(energy_card, text="⚡ Uygula", height=26, fg_color="#332B10", hover_color="#4A3E14", text_color="#FFD700",
-                      font=ctk.CTkFont(size=11, weight="bold"), command=self.apply_energy_settings).pack(pady=(2, 8), padx=8, fill="x")
 
         # Kalite Seçici
         self.quality_menu = ctk.CTkOptionMenu(self.sidebar, values=["Standard (600p)", "HD (1.5× SS)", "FHD (2× SS)"], command=self.set_render_quality)
@@ -186,6 +163,7 @@ class RobotKontrolApp(ctk.CTk):
         self.page_manual = ManualPage(self.pages_frame, self, self.sim_engine)
         self.page_fk = FKPage(self.pages_frame, self)
         self.page_ik = IKPage(self.pages_frame, self, self.kinematics_engine, self.telemetry_engine)
+        self.page_energy = EnergyPage(self.pages_frame, self, self.telemetry_engine, self.sim_engine)
 
         # 3. ANALYSIS PANEL
         self.analysis_panel = AnalysisPanel(self)
@@ -230,11 +208,13 @@ class RobotKontrolApp(ctk.CTk):
         self.page_manual.pack_forget()
         self.page_fk.pack_forget()
         self.page_ik.pack_forget()
+        self.page_energy.pack_forget()
         self.current_page = page_name
 
         if page_name == "manual": self.page_manual.pack(fill="both", expand=True)
         elif page_name == "fk": self.page_fk.pack(fill="both", expand=True)
         elif page_name == "ik": self.page_ik.pack(fill="both", expand=True)
+        elif page_name == "energy": self.page_energy.pack(fill="both", expand=True)
 
     def toggle_obstacle(self):
         state, msg = self.sim_engine.toggle_obstacle()
@@ -254,10 +234,13 @@ class RobotKontrolApp(ctk.CTk):
         self.btn_nav_workspace.configure(text="Saydam İzi Temizle" if state else "Saydam İzi Göster")
 
     def apply_energy_settings(self):
+        page = self.page_energy
+        self.telemetry_engine.apply_motor_settings(page.motor_settings())
         self.status_message = self.telemetry_engine.apply_payload_settings(
-            self.entry_payload.get(), self.entry_tariff.get(), self.entry_efficiency.get(), self.entry_robot_mass.get())
-        self.entry_robot_mass.delete(0, "end")
-        self.entry_robot_mass.insert(0, f"{self.telemetry_engine.robot_mass_kg:.1f}")
+            page.entry_payload.get(), page.entry_tariff.get(), page.entry_efficiency.get(), page.entry_robot_mass.get())
+        page.entry_robot_mass.delete(0, "end")
+        page.entry_robot_mass.insert(0, f"{self.telemetry_engine.robot_mass_kg:.1f}")
+        page.show_motor_summary()
 
     def reset_energy_counter(self):
         self.status_message = self.telemetry_engine.reset_energy_counter()
@@ -416,11 +399,13 @@ class RobotKontrolApp(ctk.CTk):
         if canvas: canvas.bind("<MouseWheel>", _on_wheel, add="+")
 
     def on_model_loaded(self):
-        # Yeni modelin kendi ağırlığı alana yazılır; yük ve tarife alanları korunur ve yeni gövdeye uygulanır
-        self.entry_robot_mass.delete(0, "end")
-        self.entry_robot_mass.insert(0, f"{self.telemetry_engine.robot_mass_default:.1f}")
+        # Yeni modelin kendi ağırlığı alana yazılır; yük, tarife ve motor alanları korunur ve yeni gövdeye uygulanır
+        page = self.page_energy
+        page.rebuild_axis_rows()
+        page.entry_robot_mass.delete(0, "end")
+        page.entry_robot_mass.insert(0, f"{self.telemetry_engine.robot_mass_default:.1f}")
         source = self.telemetry_engine.mass_source
-        self.lbl_mass_source.configure(text=f"Robot kütlesi: {source}" + (" (ρ=1.5 t/m³)" if "tahmini" in source else ""))
+        page.lbl_mass_source.configure(text=f"Robot kütlesi: {source}" + (" (ρ=1.5 t/m³)" if "tahmini" in source else ""))
         self.apply_energy_settings()
 
         # Hedef listesi ve konum geçmişi modelin eksen sayısına göre yeniden boyutlanır;
@@ -571,6 +556,7 @@ class RobotKontrolApp(ctk.CTk):
             if not self.sim_engine.e_stop_active and (current_time - last_safety_time >= 0.05):
                 last_safety_time = current_time
                 reason = self.kinematics_engine.detect_collision(check_floor=getattr(self, "is_trajectory_playing", False))
+                if not reason: reason = self.telemetry_engine.detect_overload(targets)
                 if reason: self.trigger_estop(reason)
 
             if self.kinematics_engine.show_workspace and (current_time - last_swept_time >= (1.0 / 15.0)):

@@ -246,6 +246,7 @@ class KinematicsEngine:
         """Rotayı oynatıcının izleyeceği şekilde (eşit süreli segmentler, aynı hız profili) örnekler; her an
         için gereken eklem torkunu ters dinamikle (robot ve yük kütleleriyle) hesaplar. -> (enerji J, tepe güç W)"""
         robot, n = self.sim_engine.robotId, len(self.sim_engine.revolute_joints)
+        self.last_peak_torques = [0.0] * n
         if robot is None or not waypoints or total_duration <= 0 or not self.telemetry.dynamics_ok: return 0.0, 0.0
         seg = total_duration / len(waypoints)
         energy, peak, prev = 0.0, 0.0, list(start)[:n]
@@ -257,6 +258,7 @@ class KinematicsEngine:
                     power = self.telemetry.electrical_power(qd, tau)
                     energy += power * seg / samples
                     peak = max(peak, power)
+                    self.last_peak_torques = [max(a, abs(b)) for a, b in zip(self.last_peak_torques, tau)]
                 prev = list(wp)
         return energy, peak
 
@@ -441,7 +443,9 @@ class KinematicsEngine:
 
         # Enerji: rota iki hız profiliyle ters dinamikten (robot + yük kütlesi) hesaplanır
         energy_fast_joules, self.peak_power_fast = self.estimate_route_energy(current_joint_angles, self.pending_waypoints, self.time_fast, "fast")
+        peak_tau_fast = list(self.last_peak_torques)
         energy_eco_joules, self.peak_power_eco = self.estimate_route_energy(current_joint_angles, self.pending_waypoints, self.time_eco, "eco")
+        peak_tau_eco = list(self.last_peak_torques)
         cost_fast_tl = energy_fast_joules / 3.6e6 * tariff
         cost_eco_tl = energy_eco_joules / 3.6e6 * tariff
 
@@ -475,6 +479,18 @@ class KinematicsEngine:
             math_log += f"  >> TASARRUF FARKI : Ekonomik rota ile %{(1 - cost_eco_tl / max(1e-12, cost_fast_tl)) * 100:.1f} daha az elektrik.\n\n"
         else:
             math_log += f"  >> TASARRUF FARKI : Hızlı rota %{(1 - cost_fast_tl / max(1e-12, cost_eco_tl)) * 100:.1f} daha ucuz (kısa sürede bekleme ve tutma kayıpları daha az birikir).\n\n"
+
+        # Girilen motor verisiyle (toplam güç / eksen etiketi) tork sınırı aşılıyor mu
+        torque_warnings = []
+        for k, spec in enumerate(self.telemetry.motor_specs):
+            if not spec["real_limit"] or k >= len(peak_tau_fast): continue
+            unit = "N" if spec["linear"] else "N·m"
+            if peak_tau_eco[k] > spec["limit"]:
+                torque_warnings.append(f"  [!] J{k + 1}: iki rotada da tork yetmiyor (Eko {peak_tau_eco[k]:.2f} > sınır {spec['limit']:.2f} {unit})")
+            elif peak_tau_fast[k] > spec["limit"]:
+                torque_warnings.append(f"  [!] J{k + 1}: Hızlı rotada tork yetmiyor ({peak_tau_fast[k]:.2f} > {spec['limit']:.2f} {unit}), Eko yeterli")
+        if torque_warnings:
+            math_log += ">> MOTOR TORK KONTROLÜ\n" + "\n".join(torque_warnings) + "\n\n"
 
         math_log += ">> Adım 4: SANAL GÜVENLİK & ÇARPIŞMA ANALİZİ\n"
         has_collision_risk = False
