@@ -1,4 +1,5 @@
 import os
+import gc
 import time
 import math
 import json
@@ -32,6 +33,12 @@ PHYSICS_DT = 1.0 / 240.0
 class RobotKontrolApp(ctk.CTk):
     def __init__(self):
         super().__init__()
+
+        # Otomatik GC kapalı, toplama update_ui_loop'ta (Tk thread'i) yapılır. Aksi halde GC, render ya da fizik
+        # thread'inde tetiklenip silinen Tk nesnelerinin (ör. IK'da yeniden kurulan butonların fontları)
+        # __del__'ini orada çalıştırıyor ve Tk thread-safe olmadığı için uygulama çöküyordu (segfault).
+        gc.disable()
+        self.gc_ticks = 0
 
         self.title("FANUC LR-Mate 200iC | NexusControl Studio (Modüler Mimari)")
         self.geometry("1450x920")
@@ -210,6 +217,7 @@ class RobotKontrolApp(ctk.CTk):
         self.status_message = self.sim_engine.randomize_obstacle()
 
     def reset_estop(self):
+        self.estop_reason = None
         with self.data_lock:
             self.status_message = self.sim_engine.reset_estop(self.shared_targets)
             for var in self.page_manual.slider_vars: var.set(0.0)
@@ -269,10 +277,12 @@ class RobotKontrolApp(ctk.CTk):
 
     def run_trajectory_thread(self, strategy, waypoints, start_angles, total_duration):
         num_waypoints = len(waypoints)
-        duration_per_wp = total_duration / num_waypoints
+        # Tek süre verilirse segmentlere eşit bölünür; liste verilirse her segmentin kendi süresi
+        durations = total_duration if isinstance(total_duration, list) else [total_duration / num_waypoints] * num_waypoints
         current = start_angles
 
         for wp_idx, target_angles in enumerate(waypoints):
+            duration_per_wp = durations[wp_idx]
             steps = int(max(duration_per_wp * 30, 5))
             self.kinematics_engine.update_link_positions()
 
@@ -283,11 +293,13 @@ class RobotKontrolApp(ctk.CTk):
                 angles = [c + (tr - c) * factor for c, tr in zip(current, target_angles)]
 
                 with self.sim_engine.bullet_lock:
+                    if self.sim_engine.e_stop_active: break
                     for i, joint_idx in enumerate(self.sim_engine.revolute_joints):
                         if i < len(angles): p.resetJointState(self.sim_engine.robotId, joint_idx, angles[i])
                     if self.kinematics_engine.show_workspace: self.kinematics_engine.draw_swept_volume()
 
                 with self.data_lock:
+                    if self.sim_engine.e_stop_active: break
                     for i in range(min(len(angles), len(self.shared_targets))):
                         self.shared_targets[i] = angles[i]
 
@@ -300,20 +312,53 @@ class RobotKontrolApp(ctk.CTk):
         # Tk thread-safe değil: kayıt ve buton güncellemesi update_ui_loop'ta (ana thread) yapılır
         self.trajectory_finished = True
 
-    def go_to_ik_step(self, angles):
-        is_safe, desc = self.kinematics_engine.check_angles_safety(angles)
-        if not is_safe:
-            messagebox.showwarning("Çarpışma Engeli", f"Bu konuma gidilemez:\n{desc}")
-            self.status_message = f"UYARI: {desc}! Hareket iptal edildi."
-            return
+    def route_position(self, angles, waypoints):
+        """Robot rotadaki bir waypoint'te duruyorsa onun indeksi, değilse None. Sadece TCP zincirindeki
+        eklemlere bakılır; gripper parmakları IK'dan sonra değişmiş olabilir."""
+        chain = self.kinematics_engine.ee_chain_joints()
+        cols = [k for k, j in enumerate(self.sim_engine.revolute_joints) if j in chain and k < len(angles)]
+        for idx, wp in enumerate(waypoints):
+            if all(abs(angles[k] - wp[k]) < 1e-3 for k in cols if k < len(wp)):
+                return idx
+        return None
 
-        # Işınlamak yerine Eko rotanın S-eğrisiyle oraya gider; süre Eko rota tahminiyle aynı ölçekte
+    def go_to_ik_step(self, target_idx):
+        waypoints = self.kinematics_engine.pending_waypoints
+        if not 0 <= target_idx < len(waypoints): return
         with self.data_lock:
             current = list(self.shared_targets)
+
+        # Aradaki manevralar engel kaçışının parçası olabilir, atlanmaz: robot rotada bir noktadaysa oradan,
+        # değilse baştan başlayarak hedefe kadar sırayla oynatılır (hedef gerideyse ters sırayla).
+        at = self.route_position(current, waypoints)
+        if at == target_idx:
+            self.status_message = f"Robot zaten Manevra {target_idx + 1} konumunda."
+            return
+        if at is None:
+            sequence = list(range(0, target_idx + 1))
+        elif at < target_idx:
+            sequence = list(range(at + 1, target_idx + 1))
+        else:
+            sequence = list(range(at - 1, target_idx - 1, -1))
+
+        # Duruşlar ve aradaki yollar tıklama anında tekrar kontrol edilir (engel IK'dan sonra değişmiş olabilir)
         prismatic = self.kinematics_engine.prismatic_joint_flags()
-        max_deg = max([abs(math.degrees(a - c)) for a, c, lin in zip(angles, current, prismatic) if not lin] or [0.0])
-        duration = max(0.5, max_deg / 100.0) * 1.8
-        self.start_trajectory("eco", [angles], duration, "Manevra konumuna gidiliyor...")
+        steps, durations, prev = [], [], current
+        for idx in sequence:
+            wp = waypoints[idx]
+            is_safe, desc = self.kinematics_engine.check_angles_safety(wp)
+            if is_safe:
+                is_safe, desc = self.kinematics_engine.check_path_safety(prev, wp)
+            if not is_safe:
+                messagebox.showwarning("Çarpışma Engeli", f"Manevra {idx + 1} konumuna gidilemez:\n{desc}")
+                self.status_message = f"UYARI: Manevra {idx + 1}: {desc}! Hareket iptal edildi."
+                return
+            # Her segment Eko rotanın S-eğrisi ve süre ölçeğiyle
+            max_deg = max([abs(math.degrees(a - c)) for a, c, lin in zip(wp, prev, prismatic) if not lin] or [0.0])
+            steps.append(wp); durations.append(max(0.5, max_deg / 100.0) * 1.8); prev = wp
+
+        label = f"Manevra {sequence[0] + 1}" if len(sequence) == 1 else f"Manevra {sequence[0] + 1} → {sequence[-1] + 1}"
+        self.start_trajectory("eco", steps, durations, f"{label} oynatılıyor...")
 
     def make_scroll_smooth(self, scrollable_frame, step_px=50):
         def _on_wheel(event):
@@ -340,6 +385,7 @@ class RobotKontrolApp(ctk.CTk):
             self.history_idx = 0
         self.page_manual.rebuild_joint_sliders(self.sim_engine.revolute_joints, self.sim_engine.robotId, self.make_scroll_smooth)
         self.page_ik.update_limits()
+        self.sliders_locked = None  # yeni slider'lara kilit durumu bir sonraki UI tick'inde uygulanır
 
     def save_position(self):
         current_pos = [var.get() for var in self.page_manual.slider_vars]
@@ -454,6 +500,7 @@ class RobotKontrolApp(ctk.CTk):
         last_time = time.perf_counter()
         last_swept_time = last_time
         last_transform_time = last_time
+        last_safety_time = last_time
 
         while self.is_running:
             current_time = time.perf_counter()
@@ -472,6 +519,12 @@ class RobotKontrolApp(ctk.CTk):
             while accumulator >= PHYSICS_DT:
                 self.sim_engine.step_simulation(targets)
                 accumulator -= PHYSICS_DT
+
+            # Çarpışma -> E-stop (20 Hz). 08e7e66 refactor'ünde bu kontrol kaybolmuştu.
+            if not self.sim_engine.e_stop_active and (current_time - last_safety_time >= 0.05):
+                last_safety_time = current_time
+                reason = self.kinematics_engine.detect_collision(check_floor=getattr(self, "is_trajectory_playing", False))
+                if reason: self.trigger_estop(reason)
 
             if self.kinematics_engine.show_workspace and (current_time - last_swept_time >= (1.0 / 15.0)):
                 last_swept_time = current_time
@@ -505,6 +558,17 @@ class RobotKontrolApp(ctk.CTk):
 
             time.sleep(max(0.0, PHYSICS_DT - (time.perf_counter() - current_time)))
 
+    def trigger_estop(self, reason):
+        # Arka plan thread'inden çağrılır, Tk'ye dokunmaz. Hedefler robotun durduğu yere çekilir;
+        # update_ui_loop slider'ları bu değerlere kilitler, böylece slider çarpışma noktasından ileri gitmez.
+        with self.sim_engine.bullet_lock:
+            self.sim_engine.e_stop_active = True
+            held = [s[0] for s in p.getJointStates(self.sim_engine.robotId, self.sim_engine.revolute_joints)]
+        with self.data_lock:
+            for i in range(min(len(held), len(self.shared_targets))):
+                self.shared_targets[i] = held[i]
+        self.estop_reason = reason
+
     @staticmethod
     def _transforms_equal(a, b):
         if a is None or b is None or len(a) != len(b): return False
@@ -515,6 +579,10 @@ class RobotKontrolApp(ctk.CTk):
 
     def update_ui_loop(self):
         if not self.is_running: return
+
+        # Nesil 0 her tick (~0.01 ms), nesil 1 her 10 tick, tam toplama ~30 sn'de bir (~14 ms)
+        self.gc_ticks += 1
+        gc.collect(2 if self.gc_ticks % 600 == 0 else 1 if self.gc_ticks % 10 == 0 else 0)
 
         with self.data_lock:
             n_vars = len(self.page_manual.slider_vars)
@@ -544,7 +612,12 @@ class RobotKontrolApp(ctk.CTk):
 
         self.analysis_panel.set_estop_state(self.sim_engine.e_stop_active)
         if self.sim_engine.e_stop_active:
-            self.status_message = "!!! ÇARPIŞMA TESPİT EDİLDİ - MOTORLAR KİLİTLENDİ !!!"
+            reason = getattr(self, "estop_reason", None) or "ÇARPIŞMA TESPİT EDİLDİ"
+            self.status_message = f"!!! E-STOP: {reason} - MOTORLAR KİLİTLENDİ !!!"
+        if self.sim_engine.e_stop_active != getattr(self, "sliders_locked", None):
+            self.sliders_locked = self.sim_engine.e_stop_active
+            for slider in self.page_manual.sliders:
+                slider.configure(state="disabled" if self.sliders_locked else "normal")
 
         # Telemetry updates (Mockup for original system)
         telemetry_text = f"Motor Verimi: %{self.telemetry_engine.motor_efficiency*100:.0f}\nYük: {self.telemetry_engine.payload_kg:.1f} kg\nDurum: {self.status_message}"

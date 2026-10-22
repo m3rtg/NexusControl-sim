@@ -294,9 +294,12 @@ class RobotLoader:
             p.setAdditionalSearchPath(sim_root)
 
             try:
+                # Kaide (ör. robot_stand) robotun bir linki olabilir; self-collision kapalıyken kol
+                # kaidenin içinden geçiyordu. Açık olduğunda temas fizik ve E-stop tarafından görülür.
                 self.sim_engine.robotId = p.loadURDF(
                     sanitized_urdf,
-                    [0, 0, 0], p.getQuaternionFromEuler([0, 0, 0]), useFixedBase=True
+                    [0, 0, 0], p.getQuaternionFromEuler([0, 0, 0]), useFixedBase=True,
+                    flags=p.URDF_USE_SELF_COLLISION
                 )
             except Exception as e:
                 return False, f"URDF Yükleme hatası: {e}", None
@@ -398,6 +401,11 @@ class RobotLoader:
             else:
                 self.kinematics_engine.arm_length_cm = self.kinematics_engine.robot_reach_cm * 0.9
 
+            # Engel bu modelin ölçüsünde oluşturulur; eski modelin engeli yeni kaidenin içinde kalabilir
+            self.sim_engine.obstacle_scale = self.kinematics_engine.robot_reach_cm / 80.0
+            self.sim_engine.obstacle_keep_out = self.kinematics_engine.stand_half_extent_cm / 100.0
+            self.sim_engine.remove_obstacle()
+
             j_lower, j_upper, j_ranges, j_rest = [], [], [], []
             for j_idx in revolute_joints:
                 info = p.getJointInfo(self.sim_engine.robotId, j_idx)
@@ -428,6 +436,9 @@ class RobotLoader:
                 lA, lB = c[3], c[4]
                 if lA != lB: allowed_cols.add((min(lA, lB), max(lA, lB)))
             self.kinematics_engine.allowed_collision_pairs = allowed_cols
+            # Eklemle bağlı ya da duruşta zaten değen link çiftleri birbirini itmesin
+            for lA, lB in allowed_cols:
+                p.setCollisionFilterPair(self.sim_engine.robotId, self.sim_engine.robotId, lA, lB, 0)
 
             try:
                 shapes = p.getVisualShapeData(self.sim_engine.robotId)

@@ -130,17 +130,12 @@ def _trail_verts(segments):
     return np.concatenate([pos,nor],axis=2).reshape(-1,6).astype(np.float32)
 
 def _box_verts(hx,hy,hz):
-    data=[]
-    faces=[([[ hx,-hy,-hz],[ hx, hy,-hz],[ hx, hy, hz],[ hx,-hy, hz]],[1,0,0]),
-           ([[-hx, hy,-hz],[-hx,-hy,-hz],[-hx,-hy, hz],[-hx, hy, hz]],[-1,0,0]),
-           ([[-hx, hy,-hz],[ hx, hy,-hz],[ hx, hy, hz],[-hx, hy, hz]],[0,1,0]),
-           ([[ hx,-hy,-hz],[-hx,-hy,-hz],[-hx,-hy, hz],[ hx,-hy, hz]],[0,-1,0]),
-           ([[-hx,-hy, hz],[ hx,-hy, hz],[ hx, hy, hz],[-hx, hy, hz]],[0,0,1]),
-           ([[-hx, hy,-hz],[ hx, hy,-hz],[ hx,-hy,-hz],[-hx,-hy,-hz]],[0,0,-1])]
-    for verts,n in faces:
-        v0,v1,v2,v3=verts
-        for v in [v0,v1,v2,v0,v2,v3]: data+=v+n
-    return np.array(data,dtype=np.float32)
+    # trimesh yüzleri dışa bakan (CCW) sırayla verir. Elle yazılan eski listede 3 yüz ters
+    # sarılıydı ve CULL_FACE onları siliyordu: engel kutusu içi görünür/delik çiziliyordu.
+    box=trimesh.creation.box(extents=(2.0*hx,2.0*hy,2.0*hz))
+    tri=box.triangles.reshape(-1,3)
+    nrm=np.repeat(box.face_normals,3,axis=0)
+    return np.hstack([tri,nrm]).astype(np.float32)
 
 LINK_NAMES=['base_link','link_1','link_2','link_3','link_4','link_5','link_6']
 LINK_COLORS={'base_link':(0.22,0.22,0.22),'link_1':(0.96,0.76,0.13),'link_2':(0.96,0.76,0.13),
@@ -280,8 +275,9 @@ class RobotGPURenderer:
                     if vao is None:
                         try:
                             if geom_type == 3:  # GEOM_BOX
-                                hx, hy, hz = dims[0], dims[1], dims[2]
-                                mesh_obj = trimesh.creation.box(extents=[max(0.01, hx * 2), max(0.01, hy * 2), max(0.01, hz * 2)])
+                                # getVisualShapeData kutu için tam boyut verir (yarı boyut değil); eskiden 2 ile
+                                # çarpılıyordu ve URDF'teki kutular (ör. robot_stand) iki kat büyük çiziliyordu
+                                mesh_obj = trimesh.creation.box(extents=[max(0.01, dims[0]), max(0.01, dims[1]), max(0.01, dims[2])])
                             elif geom_type == 4:  # GEOM_CYLINDER
                                 length, radius = dims[0], dims[1]
                                 mesh_obj = trimesh.creation.cylinder(radius=max(0.005, radius), height=max(0.01, length))

@@ -15,6 +15,11 @@ class SimulationEngine:
         self.revolute_joints = []
         self.obstacle_id = None
         self.obstacle_pos = [0.0, 0.0, 0.0]
+        self.obstacle_half = [0.0, 0.0, 0.0]
+        # Engel boyutu ve mesafesi yüklenen modele göre ölçeklenir (RobotLoader ayarlar).
+        # 1.0 = Fanuc LR Mate (80 cm erişim); keep_out = kaidenin yarı genişliği (m)
+        self.obstacle_scale = 1.0
+        self.obstacle_keep_out = 0.0
         self.e_stop_active = False
         
         # For GPU renderer sharing
@@ -35,62 +40,61 @@ class SimulationEngine:
     def toggle_obstacle(self):
         with self.bullet_lock:
             if self.obstacle_id is None:
-                hx, hy, hz = 0.08, 0.08, 0.2
-                self.obstacle_pos = [0.4, 0.0, hz]
-                obs_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[hx, hy, hz])
-                self.obstacle_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=obs_col,
-                                                     basePosition=self.obstacle_pos)
-                
-                if self.gpu_shared_state is not None and self.gpu_state_lock is not None:
-                    with self.gpu_state_lock:
-                        self.gpu_shared_state['obstacle'] = (list(self.obstacle_pos), [hx, hy, hz])
+                s = self.obstacle_scale
+                hx, hy, hz = 0.08 * s, 0.08 * s, 0.2 * s
+                # Kaidenin (varsa) dışında kalsın
+                x = max(0.4 * s, self.obstacle_keep_out + hx + 0.05 * s)
+                self._place_obstacle([x, 0.0, hz], [hx, hy, hz])
                 return True, "Engel aktif edildi."
             else:
-                p.removeBody(self.obstacle_id)
-                self.obstacle_id = None
-                
-                if self.gpu_shared_state is not None and self.gpu_state_lock is not None:
-                    with self.gpu_state_lock:
-                        self.gpu_shared_state['obstacle'] = None
+                self.remove_obstacle()
                 return False, "Engel kaldirildi."
 
     def randomize_obstacle(self):
         with self.bullet_lock:
-            if self.obstacle_id is not None:
-                p.removeBody(self.obstacle_id)
+            s = self.obstacle_scale
+            # Kolun o anki duruşuyla çakışan konum çıkarsa yeniden dene; yoksa engel anında E-stop tetikler
+            for _ in range(30):
+                hx = random.uniform(0.04, 0.08) * s
+                hy = random.uniform(0.04, 0.08) * s
+                hz = random.uniform(0.15, 0.40) * s
 
-            hx = random.uniform(0.04, 0.08)
-            hy = random.uniform(0.04, 0.08)
-            hz = random.uniform(0.15, 0.40)
+                # Kare kaidenin köşesine de değmemesi için merkezden en az bu kadar uzakta olmalı
+                r_min = (self.obstacle_keep_out + max(hx, hy)) * math.sqrt(2) + 0.05 * s
+                angle = random.uniform(-math.pi / 1.5, math.pi / 1.5)
+                radius = random.uniform(max(0.35 * s, r_min), max(0.60 * s, r_min + 0.25 * s))
+                x = radius * math.cos(angle)
+                y = radius * math.sin(angle)
 
-            angle = random.uniform(-math.pi / 1.5, math.pi / 1.5)
-            radius = random.uniform(0.35, 0.60)
-            x = radius * math.cos(angle)
-            y = radius * math.sin(angle)
-            z = hz
-
-            self.obstacle_pos = [x, y, z]
-            obs_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[hx, hy, hz])
-            self.obstacle_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=obs_col,
-                                                 basePosition=self.obstacle_pos)
-                                                 
-            if self.gpu_shared_state is not None and self.gpu_state_lock is not None:
-                with self.gpu_state_lock:
-                    self.gpu_shared_state['obstacle'] = ([x, y, z], [hx, hy, hz])
-
+                self._place_obstacle([x, y, hz], [hx, hy, hz])
+                if self.robotId is None or not p.getClosestPoints(self.robotId, self.obstacle_id, 0.02 * s):
+                    break
             return f"Rastgele Engel: Uzunluk {hz * 200:.0f}cm, X:{x * 100:.0f} Y:{y * 100:.0f}"
 
-    def reset_estop(self, shared_targets):
-        self.e_stop_active = False
+    def _place_obstacle(self, pos, half):
+        if self.obstacle_id is not None:
+            p.removeBody(self.obstacle_id)
+        self.obstacle_pos = list(pos)
+        self.obstacle_half = list(half)
+        obs_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half)
+        self.obstacle_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=obs_col, basePosition=pos)
+        if self.gpu_shared_state is not None and self.gpu_state_lock is not None:
+            with self.gpu_state_lock:
+                self.gpu_shared_state['obstacle'] = (list(pos), list(half))
+
+    def remove_obstacle(self):
         with self.bullet_lock:
             if self.obstacle_id is not None:
                 p.removeBody(self.obstacle_id)
                 self.obstacle_id = None
-                
-            if self.gpu_shared_state is not None and self.gpu_state_lock is not None:
-                with self.gpu_state_lock:
-                    self.gpu_shared_state['obstacle'] = None
-                    
+        if self.gpu_shared_state is not None and self.gpu_state_lock is not None:
+            with self.gpu_state_lock:
+                self.gpu_shared_state['obstacle'] = None
+
+    def reset_estop(self, shared_targets):
+        self.e_stop_active = False
+        with self.bullet_lock:
+            self.remove_obstacle()
             if self.robotId is not None:
                 for i, joint_idx in enumerate(self.revolute_joints):
                     p.resetJointState(self.robotId, joint_idx, 0.0)

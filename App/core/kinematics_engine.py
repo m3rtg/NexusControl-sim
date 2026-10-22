@@ -59,6 +59,36 @@ class KinematicsEngine:
                 curr = p.getJointInfo(self.sim_engine.robotId, curr)[16]
         return chain
 
+    def detect_collision(self, check_floor):
+        """Gerçek temas kontrolü (E-stop için). Çarpışma varsa açıklama, yoksa None döner.
+        Engel ve gövde/kaide teması her zaman; kaide/zemin seviye kontrolü sadece yörünge oynarken
+        yapılır (refactor öncesi davranış)."""
+        with self.sim_engine.bullet_lock:
+            robot = self.sim_engine.robotId
+            if robot is None: return None
+
+            if self.sim_engine.obstacle_id is not None:
+                hits = [c for c in p.getContactPoints(robot, self.sim_engine.obstacle_id) if c[8] < 0.0]
+                if hits:
+                    return f"ENGELE ÇARPTI ({self.link_names.get(hits[0][3], f'Link {hits[0][3]}')})"
+
+            for c in p.getContactPoints(robot, robot):
+                lA, lB = c[3], c[4]
+                if lA == lB or c[8] >= 0.0 or (min(lA, lB), max(lA, lB)) in self.allowed_collision_pairs: continue
+                return f"GÖVDE ÇARPIŞMASI ({self.link_names.get(lA, f'Link {lA}')} <-> {self.link_names.get(lB, f'Link {lB}')})"
+
+            if check_floor:
+                for j_idx in self.sim_engine.revolute_joints:
+                    ls = p.getLinkState(robot, j_idx)
+                    lx, ly, lz = ls[4][0] * 100.0, ls[4][1] * 100.0, ls[4][2] * 100.0
+                    name = self.link_names.get(j_idx, f"Link {j_idx}")
+                    if self.stand_half_extent_cm > 0 and abs(lx) <= self.stand_half_extent_cm and abs(ly) <= self.stand_half_extent_cm:
+                        if lz < self.stand_top_cm - 0.5:
+                            return f"KAİDEYE ÇARPTI ({name})"
+                    elif lz < -1.0:
+                        return f"ZEMİNE ÇARPTI ({name})"
+        return None
+
     def calculate_fk(self):
         """Calculates Forward Kinematics and returns formatted log text."""
         with self.sim_engine.bullet_lock:
@@ -133,29 +163,54 @@ class KinematicsEngine:
                             nameB = self.link_names.get(lB, f"Link_{lB}")
                             return False, f"Gövde Çarpışması ({nameA} <-> {nameB})"
 
-                # 2. Stand & Ground
-                for j_idx in self.sim_engine.revolute_joints:
-                    ls = p.getLinkState(self.sim_engine.robotId, j_idx)
-                    lx = ls[4][0] * 100.0
-                    ly = ls[4][1] * 100.0
-                    lz = ls[4][2] * 100.0
-                    if self.stand_half_extent_cm > 0 and abs(lx) <= self.stand_half_extent_cm and abs(ly) <= self.stand_half_extent_cm:
-                        if lz < self.stand_top_cm:
-                            name = self.link_names.get(j_idx, f"Link_{j_idx}")
-                            return False, f"Kaideye Çarpma ({name})"
-                    elif lz < 2.0:
-                        name = self.link_names.get(j_idx, f"Link_{j_idx}")
-                        return False, f"Zemine Çarpma ({name})"
+                # 2-3. Kaide/zemin ve engel
+                hit = self._pose_hits_environment()
+                if hit: return False, hit
 
-                # 3. Dynamic Obstacle
-                if self.sim_engine.obstacle_id is not None:
-                    obs_contacts = p.getContactPoints(self.sim_engine.robotId, self.sim_engine.obstacle_id)
-                    real_obs = [c for c in obs_contacts if c[8] < 0.0]
-                    if real_obs:
-                        c = real_obs[0]
-                        link_hit = self.link_names.get(c[3], f"Link_{c[3]}")
-                        return False, f"Engelle Çarpışma ({link_hit})"
+                return True, "Güvenli (Çarpışmasız)"
+            finally:
+                for i, j_idx in enumerate(self.sim_engine.revolute_joints):
+                    p.resetJointState(self.sim_engine.robotId, j_idx, original_states[i][0], original_states[i][1])
 
+    def _pose_hits_environment(self):
+        """Robotun o anki (resetJointState ile kurulmuş) duruşu kaideye, zemine veya engele giriyor mu?
+        Ucuz kontroller (~0.1 ms); yol örneklemede her adımda çağrılır. bullet_lock tutulurken çağrılmalı."""
+        robot = self.sim_engine.robotId
+        for j_idx in self.sim_engine.revolute_joints:
+            ls = p.getLinkState(robot, j_idx)
+            lx, ly, lz = ls[4][0] * 100.0, ls[4][1] * 100.0, ls[4][2] * 100.0
+            if self.stand_half_extent_cm > 0 and abs(lx) <= self.stand_half_extent_cm and abs(ly) <= self.stand_half_extent_cm:
+                if lz < self.stand_top_cm:
+                    return f"Kaideye Çarpma ({self.link_names.get(j_idx, f'Link_{j_idx}')})"
+            elif lz < 2.0:
+                return f"Zemine Çarpma ({self.link_names.get(j_idx, f'Link_{j_idx}')})"
+
+        if self.sim_engine.obstacle_id is not None:
+            # getContactPoints son fizik adımının temaslarını verir, resetJointState ile kurulan deneme
+            # duruşunu görmez (her duruş "güvenli" çıkıyordu). getClosestPoints geometriyi o an hesaplar.
+            # Küçük pay: rota engeli sıyırırsa çalışırken E-stop tetiklenir.
+            margin = 0.01 * self.sim_engine.obstacle_scale
+            pts = p.getClosestPoints(robot, self.sim_engine.obstacle_id, margin)
+            if pts:
+                return f"Engelle Çarpışma ({self.link_names.get(pts[0][3], f'Link_{pts[0][3]}')})"
+        return None
+
+    def check_path_safety(self, start, end):
+        """Yörünge oynatıcısı eklem uzayında doğrusal gider (Hızlı ve Eko aynı yolu farklı hızda izler).
+        Bu yol ~2°'lik adımlarla kaide/zemin/engel için örneklenir. Gövde içi çarpışma pahalı
+        (Fanuc'ta ~5 ms) olduğu için sadece waypoint'lerde bakılır; çalışırken E-stop yine yakalar."""
+        n = min(len(start), len(end), len(self.sim_engine.revolute_joints))
+        if n == 0: return True, "Güvenli (Çarpışmasız)"
+        steps = max(1, math.ceil(max(abs(end[i] - start[i]) for i in range(n)) / math.radians(2.0)))
+        with self.sim_engine.bullet_lock:
+            original_states = p.getJointStates(self.sim_engine.robotId, self.sim_engine.revolute_joints)
+            try:
+                for k in range(1, steps + 1):
+                    t = k / steps
+                    for i in range(n):
+                        p.resetJointState(self.sim_engine.robotId, self.sim_engine.revolute_joints[i], start[i] + (end[i] - start[i]) * t)
+                    hit = self._pose_hits_environment()
+                    if hit: return False, f"{hit}, rota üzerinde"
                 return True, "Güvenli (Çarpışmasız)"
             finally:
                 for i, j_idx in enumerate(self.sim_engine.revolute_joints):
@@ -188,7 +243,7 @@ class KinematicsEngine:
         locked = [k for k, j_idx in enumerate(self.sim_engine.revolute_joints)
                   if j_idx not in ee_chain and k < len(current_joint_angles)]
 
-        def solve_ik_pose(target_pos):
+        def solve_ik_pose(target_pos, seed=None):
             ik_kwargs = {
                 'maxNumIterations': 400,
                 'residualThreshold': 1e-4
@@ -201,7 +256,7 @@ class KinematicsEngine:
 
             yaw_base = math.atan2(target_pos[1], target_pos[0]) if (target_pos[0] != 0 or target_pos[1] != 0) else 0.0
             candidate_seeds = [
-                current_joint_angles,
+                seed if seed is not None else current_joint_angles,
                 [yaw_base, -0.4, 0.4] + [0.0] * max(0, n_joints - 3),
                 [yaw_base, -0.7, 0.8] + [0.0] * max(0, n_joints - 3),
                 [yaw_base, 0.0, 0.0] + [0.0] * max(0, n_joints - 3),
@@ -256,26 +311,71 @@ class KinematicsEngine:
 
             return best_angles, best_err, best_safe, best_desc
 
+        def route_safety(route):
+            """Her waypoint için (güvenli, açıklama): hem duruşun kendisi hem önceki noktadan oraya giden yol."""
+            result, prev = [], current_joint_angles
+            for angles, _, safe, desc in route:
+                if safe:
+                    safe, desc = self.check_path_safety(prev, angles)
+                result.append((safe, desc))
+                prev = angles
+            return result
+
         with self.sim_engine.bullet_lock:
+            final = solve_ik_pose([x_m, y_m, z_m])
+            final_angles, final_err, final_safe, final_desc = final
+            route, route_checks = [final], route_safety([final])
+
             if self.sim_engine.obstacle_id is not None:
-                state = p.getLinkState(self.sim_engine.robotId, getattr(self.sim_engine, 'end_effector_index', 0))
-                cx, cy, cz = state[4]
-                safe_z = max(cz, z_m, self.sim_engine.obstacle_pos[2] + 0.35)
+                if all(ok for ok, _ in route_checks):
+                    math_log += ">> Engel algılandı; doğrudan rota engele değmiyor, kaçış gerekmedi.\n\n"
+                elif not final_safe:
+                    # Hedef duruşun kendisi çarpışıyorsa hiçbir kaçış rotası işe yaramaz
+                    math_log += f">> [!] Engel algılandı; hedef konumda çarpışma var ({final_desc}).\n\n"
+                else:
+                    # Doğrudan rota engele değiyor: önce yukarı, engelin üstünden hedefin üstüne, sonra aşağı.
+                    # Tüm rota temiz çıkana kadar irtifa artırılır (tepe + 15/30/45/60 cm, model ölçeğinde).
+                    state = p.getLinkState(self.sim_engine.robotId, getattr(self.sim_engine, 'end_effector_index', 0))
+                    cx, cy, cz = state[4]
+                    obstacle_top = self.sim_engine.obstacle_pos[2] + self.sim_engine.obstacle_half[2]
+                    found_z = None
+                    yaw0, yaw1 = math.atan2(cy, cx), math.atan2(y_m, x_m)
+                    d_yaw = (yaw1 - yaw0 + math.pi) % (2 * math.pi) - math.pi
+                    r0, r1 = math.hypot(cx, cy), math.hypot(x_m, y_m)
+                    n_arc = max(1, math.ceil(abs(d_yaw) / math.radians(30)))
+                    for k in range(1, 5):
+                        safe_z = max(cz, z_m, obstacle_top + 0.15 * k * self.sim_engine.obstacle_scale)
+                        # Yukarı çık, bu irtifada taban etrafında yay çizerek (~30°'de bir ara nokta) hedefin
+                        # üstüne git, sonra in. İki uç nokta arasında eklem uzayında doğrudan gitmek ön kolu
+                        # engele indirebiliyordu. Her nokta öncekinden başlatılır ki dirsek yön değiştirmesin.
+                        points = [[cx, cy, safe_z]]
+                        for i in range(1, n_arc):
+                            yaw, r = yaw0 + d_yaw * i / n_arc, r0 + (r1 - r0) * i / n_arc
+                            points.append([r * math.cos(yaw), r * math.sin(yaw), safe_z])
+                        points.append([x_m, y_m, safe_z])
 
-                wp1, err1, safe1, desc1 = solve_ik_pose([cx, cy, safe_z])
-                self.pending_waypoints.append(wp1)
-                self.pending_waypoint_safety.append((safe1, desc1))
+                        candidate, checks, prev, ok = [], [], current_joint_angles, True
+                        for pt in points:
+                            wp = solve_ik_pose(pt, seed=prev)
+                            safe, desc = wp[2], wp[3]
+                            if safe: safe, desc = self.check_path_safety(prev, wp[0])
+                            candidate.append(wp); checks.append((safe, desc)); prev = wp[0]
+                            if not safe: ok = False; break
+                        if ok:
+                            safe, desc = final_safe, final_desc
+                            if safe: safe, desc = self.check_path_safety(prev, final_angles)
+                            candidate.append(final); checks.append((safe, desc)); ok = safe
+                        if ok:
+                            route, route_checks, found_z = candidate, checks, safe_z
+                            break
+                    if found_z is not None:
+                        math_log += f">> OTONOM KAÇIŞ AKTİF: Engel Algılandı.\n"
+                        math_log += f">> {found_z * 100:.0f}cm irtifadan U-Dönüş rotası çizildi.\n\n"
+                    else:
+                        math_log += ">> [!] Engel algılandı; çarpışmasız bir rota bulunamadı.\n\n"
 
-                wp2, err2, safe2, desc2 = solve_ik_pose([x_m, y_m, safe_z])
-                self.pending_waypoints.append(wp2)
-                self.pending_waypoint_safety.append((safe2, desc2))
-
-                math_log += f">> OTONOM KAÇIŞ AKTİF: Engel Algılandı.\n"
-                math_log += f">> {safe_z * 100:.0f}cm irtifadan U-Dönüş rotası çizildi.\n\n"
-
-            final_angles, final_err, final_safe, final_desc = solve_ik_pose([x_m, y_m, z_m])
-            self.pending_waypoints.append(final_angles)
-            self.pending_waypoint_safety.append((final_safe, final_desc))
+            self.pending_waypoints = [wp[0] for wp in route]
+            self.pending_waypoint_safety = route_checks
 
         deg_diffs = [abs(math.degrees(self.pending_waypoints[-1][i] - current_joint_angles[i])) for i in range(min(n_joints, len(current_joint_angles)))
                      if not (i < len(prismatic) and prismatic[i])]
@@ -288,7 +388,7 @@ class KinematicsEngine:
 
         time_base = max(0.5, max_deg / 100.0)
         self.time_fast = time_base * duration_factor
-        if self.sim_engine.obstacle_id is not None: self.time_fast *= 1.5
+        if len(self.pending_waypoints) > 1: self.time_fast *= 1.5
         self.time_eco = self.time_fast * 1.8
 
         eff = self.telemetry.motor_efficiency
