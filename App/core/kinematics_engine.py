@@ -54,6 +54,9 @@ class KinematicsEngine:
         # Output artifacts
         self.pending_waypoints = []
         self.pending_waypoint_safety = []
+        self.pending_waypoint_labels = []   # arayüz için durak adları (i18n anahtarları)
+        self.last_segment_energy = []       # son tahminde segment başına enerji (J)
+        self.route_segment_energy = []      # son IK rotasının Hızlı profilde segment enerjileri
         self.time_fast = 0.0
         self.time_eco = 0.0
         self.peak_power_fast = 0.0
@@ -247,19 +250,23 @@ class KinematicsEngine:
         için gereken eklem torkunu ters dinamikle (robot ve yük kütleleriyle) hesaplar. -> (enerji J, tepe güç W)"""
         robot, n = self.sim_engine.robotId, len(self.sim_engine.revolute_joints)
         self.last_peak_torques = [0.0] * n
+        self.last_segment_energy = []
         if robot is None or not waypoints or total_duration <= 0 or not self.telemetry.dynamics_ok: return 0.0, 0.0
         seg = total_duration / len(waypoints)
         energy, peak, prev = 0.0, 0.0, list(start)[:n]
         with self.sim_engine.bullet_lock:
             for wp in waypoints:
+                seg_energy = 0.0
                 for k in range(samples):
                     q, qd, qdd = self.profile_state(prev, wp, seg, strategy, (k + 0.5) / samples)
                     tau = self.telemetry.joint_torques(q, qd, qdd)
                     power = self.telemetry.electrical_power(qd, tau)
                     energy += power * seg / samples
+                    seg_energy += power * seg / samples
                     peak = max(peak, power)
                     self.last_peak_torques = [max(a, abs(b)) for a, b in zip(self.last_peak_torques, tau)]
                 prev = list(wp)
+                self.last_segment_energy.append(seg_energy)
         return energy, peak
 
     def calculate_ik(self, x_val, y_val, z_val, current_joint_angles):
@@ -371,6 +378,7 @@ class KinematicsEngine:
             final = solve_ik_pose([x_m, y_m, z_m])
             final_angles, final_err, final_safe, final_desc = final
             route, route_checks = [final], route_safety([final])
+            labels = ["route.target"]
 
             if self.sim_engine.obstacle_id is not None:
                 if all(ok for ok, _ in route_checks):
@@ -413,6 +421,8 @@ class KinematicsEngine:
                             candidate.append(final); checks.append((safe, desc)); ok = safe
                         if ok:
                             route, route_checks, found_z = candidate, checks, safe_z
+                            labels = (["route.up"] + [f"route.arc:{i}" for i in range(1, len(points) - 1)]
+                                      + ["route.above", "route.target"])
                             break
                     if found_z is not None:
                         math_log += f">> OTONOM KAÇIŞ AKTİF: Engel Algılandı.\n"
@@ -421,6 +431,7 @@ class KinematicsEngine:
                         math_log += ">> [!] Engel algılandı; çarpışmasız bir rota bulunamadı.\n\n"
 
             self.pending_waypoints = [wp[0] for wp in route]
+            self.pending_waypoint_labels = labels if len(labels) == len(route) else [f"route.step:{i + 1}" for i in range(len(route))]
             self.pending_waypoint_safety = route_checks
 
         deg_diffs = [abs(math.degrees(self.pending_waypoints[-1][i] - current_joint_angles[i])) for i in range(min(n_joints, len(current_joint_angles)))
@@ -444,6 +455,7 @@ class KinematicsEngine:
         # Enerji: rota iki hız profiliyle ters dinamikten (robot + yük kütlesi) hesaplanır
         energy_fast_joules, self.peak_power_fast = self.estimate_route_energy(current_joint_angles, self.pending_waypoints, self.time_fast, "fast")
         peak_tau_fast = list(self.last_peak_torques)
+        self.route_segment_energy = list(self.last_segment_energy)
         energy_eco_joules, self.peak_power_eco = self.estimate_route_energy(current_joint_angles, self.pending_waypoints, self.time_eco, "eco")
         peak_tau_eco = list(self.last_peak_torques)
         cost_fast_tl = energy_fast_joules / 3.6e6 * tariff

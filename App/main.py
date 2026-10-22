@@ -16,15 +16,20 @@ from core.kinematics_engine import KinematicsEngine
 from core.telemetry_engine import TelemetryEngine
 from core.robot_loader import RobotLoader
 
-from ui.pages.manual_page import ManualPage
-from ui.pages.fk_page import FKPage
-from ui.pages.ik_page import IKPage
+from ui import theme
+from ui import i18n
+from ui.i18n import t
+from ui.pages.jog_page import JogPage
+from ui.pages.target_page import TargetPage
 from ui.pages.energy_page import EnergyPage
-from ui.widgets.analysis_panel import AnalysisPanel
+from ui.pages.model_page import ModelPage
+from ui.pages.settings_page import SettingsPage
+from ui.widgets.estop_button import EStopButton
+from ui.widgets.route_timeline import RouteTimeline
+from ui.widgets.side_panel import SidePanel
 from render_engine import RobotGPURenderer
 
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+theme.apply_global()
 
 # Fizik, gerçek zamanın bu katı hızında ilerler. Robot slider'ı hızlı takip etsin diye 1'den büyük;
 # önceden bu oran makinenin döngü hızına bağlıydı (Linux'ta ~3.7x).
@@ -41,8 +46,10 @@ class RobotKontrolApp(ctk.CTk):
         gc.disable()
         self.gc_ticks = 0
 
-        self.title("FANUC LR-Mate 200iC | NexusControl Studio (Modüler Mimari)")
-        self.geometry("1450x920")
+        i18n.set_language(self.load_config().get("language", i18n.DEFAULT_LANGUAGE))
+        self.title(t("app.title"))
+        self.geometry("1400x930")
+        self.configure(fg_color=theme.BG)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.is_running = True
 
@@ -84,12 +91,14 @@ class RobotKontrolApp(ctk.CTk):
         loaded = False
         if saved_default and os.path.isfile(saved_default):
             loaded, _, _ = self.robot_loader.load_source_model(saved_default)
+            if loaded: self.current_source_path = saved_default
         if not loaded:
             self.robot_loader.load_robot_model(self.builtin_urdf_path)
+            self.current_source_path = self.builtin_urdf_path
             
         self.update_default_model_label()
         self.on_model_loaded()
-        self.show_page("manual")
+        self.show_page("jog")
 
         mesh_dir = os.path.join(os.path.dirname(__file__), "..", "fanuc_lrmate200ic_support", "meshes", "lrmate200ic", "visual")
         self.gpu_renderer = RobotGPURenderer(os.path.normpath(mesh_dir), self.q_img, self.gpu_shared_state, self.gpu_state_lock)
@@ -100,139 +109,137 @@ class RobotKontrolApp(ctk.CTk):
         self.update_ui_loop()
 
     def build_ui(self):
-        self.grid_rowconfigure(0, weight=4)
+        """Teach pendant düzeni: üstte marka/model/E-stop, solda mod anahtarı ve panel, altında rota şeridi,
+        ortada sahne (renderer'ın 600x800 karesi), sağda güç/sahne/durum/rapor."""
         self.grid_rowconfigure(1, weight=1)
-        self.grid_columnconfigure(0, weight=0, minsize=180)
-        self.grid_columnconfigure(1, weight=3, minsize=310)
-        self.grid_columnconfigure(2, weight=2, minsize=240)
-        self.grid_columnconfigure(3, weight=4, minsize=320)
+        self.grid_columnconfigure(0, weight=1)
 
-        # 1. NAVBAR
-        # Kaydırılabilir: içerik ~690 px; küçük ekranlarda/ölçeklemede alt kısım kesilmesin
-        # Genişlik eski sabit çerçevenin içerikten aldığı ~306 px; varsayılan 200 px butonları kesiyordu
-        self.sidebar = ctk.CTkScrollableFrame(self, corner_radius=0, fg_color="#141414", width=286,
-                                              scrollbar_button_color="#2A2A2A", scrollbar_button_hover_color="#3A3A3A")
-        self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        # --- ÜST ÇUBUK ---
+        top = ctk.CTkFrame(self, fg_color="transparent", height=52)
+        top.grid(row=0, column=0, sticky="ew", padx=16, pady=(10, 8))
+        mark = ctk.CTkFrame(top, fg_color="transparent")
+        mark.pack(side="left")
+        ctk.CTkLabel(mark, text="NexusControl", font=theme.font(17, "bold"), text_color=theme.FG).pack(side="left")
+        ctk.CTkLabel(mark, text="Sim", font=theme.font(17, "bold"), text_color=theme.GOLD).pack(side="left")
+        self.lbl_model_line = ctk.CTkLabel(top, text="", font=theme.font(12), text_color=theme.FG2)
+        self.lbl_model_line.pack(side="left", padx=(18, 6))
+        change = ctk.CTkLabel(top, text=t("topbar.change"), font=theme.font(12), text_color=theme.GOLD, cursor="hand2")
+        change.pack(side="left")
+        change.bind("<Button-1>", lambda e: self.show_page("model"))
 
-        logo_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        logo_frame.pack(pady=(25, 20))
-        ctk.CTkLabel(logo_frame, text="NEXUS", text_color="#005A9E", font=ctk.CTkFont(family="Impact", size=34, weight="bold")).grid(row=0, column=0, padx=(0, 2))
-        ctk.CTkLabel(logo_frame, text="CONTROL", text_color="#FFFFFF", font=ctk.CTkFont(family="Segoe UI Light", size=24)).grid(row=0, column=1, sticky="s", pady=(0, 5))
+        self.estop_btn = EStopButton(top, self.press_estop)
+        self.estop_btn.pack(side="right")
+        self.btn_reset_estop = theme.button(top, t("topbar.reset"), self.reset_estop, kind="danger", width=80, height=30)
+        self.lbl_pill = ctk.CTkLabel(top, text=t("pill.ready"), font=theme.font(11, "bold"), text_color=theme.OK,
+                                     fg_color=theme.BG2, corner_radius=999, height=28)
+        self.lbl_pill.pack(side="right", padx=(0, 14), ipadx=10)
+        langs = " | ".join(l.upper() for l in i18n.available_languages())
+        ctk.CTkLabel(top, text=langs, font=theme.font(11, "bold"), text_color=theme.FG2).pack(side="right", padx=(0, 16))
 
-        ctk.CTkButton(self.sidebar, text="Manuel Kontrol", height=40, command=lambda: self.show_page("manual")).pack(pady=8, padx=10, fill="x")
-        ctk.CTkButton(self.sidebar, text="İleri Kinematik", height=40, command=lambda: self.show_page("fk")).pack(pady=8, padx=10, fill="x")
-        ctk.CTkButton(self.sidebar, text="Ters Kinematik", height=40, command=lambda: self.show_page("ik")).pack(pady=8, padx=10, fill="x")
-        ctk.CTkButton(self.sidebar, text="Güç ve Enerji", height=40, command=lambda: self.show_page("energy")).pack(pady=8, padx=10, fill="x")
-        
-        self.btn_nav_workspace = ctk.CTkButton(self.sidebar, text="Saydam İzi Göster", height=40, fg_color="#005A9E", command=self.toggle_workspace)
-        self.btn_nav_workspace.pack(pady=(20, 8), padx=10, fill="x")
+        # --- GÖVDE ---
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 12))
+        body.grid_rowconfigure(0, weight=1)
+        body.grid_columnconfigure(3, weight=1, minsize=260)
 
-        obs_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        obs_frame.pack(pady=8, padx=10, fill="x")
-        obs_frame.grid_columnconfigure(0, weight=3)
-        obs_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkButton(obs_frame, text="Engel Aç/Kapat", width=60, height=40, fg_color="#D2691E", command=self.toggle_obstacle).grid(row=0, column=0, padx=(0, 5), sticky="ew")
-        ctk.CTkButton(obs_frame, text="Rastgele", width=60, height=40, fg_color="#555555", command=self.randomize_obstacle).grid(row=0, column=1, sticky="ew")
+        # mod anahtarı
+        dial = theme.card(body, width=72)
+        dial.grid(row=0, column=0, sticky="ns", padx=(0, theme.PAD))
+        self.mode_buttons = {}
+        for mode in ("jog", "target", "energy", "model", "settings"):
+            b = ctk.CTkButton(dial, text=t(f"mode.{mode}"), width=58, height=56, corner_radius=10, fg_color="transparent",
+                              hover_color=theme.BG3, text_color=theme.MUTED, font=theme.font(11),
+                              command=lambda m=mode: self.show_page(m))
+            b.pack(padx=6, pady=(6 if mode == "jog" else 2, 2))
+            self.mode_buttons[mode] = b
 
-        ctk.CTkButton(self.sidebar, text="E-STOP SIFIRLA", height=40, fg_color="#8B0000", command=self.reset_estop).pack(pady=(20, 8), padx=10, fill="x")
-
-        # Kalite Seçici
-        self.quality_menu = ctk.CTkOptionMenu(self.sidebar, values=["Standard (600p)", "HD (1.5× SS)", "FHD (2× SS)"], command=self.set_render_quality)
-        self.quality_menu.pack(pady=(18, 6), padx=10, fill="x")
-        self.lbl_qual_info = ctk.CTkLabel(self.sidebar, text="600p native · GPU · 60 FPS", font=ctk.CTkFont(size=10))
-        self.lbl_qual_info.pack(pady=(0, 6))
-
-        # Model Yükleyici
-        ctk.CTkButton(self.sidebar, text="📁 Model Yükle", height=34, fg_color="#1E4D2B", command=self.open_urdf_file_dialog).pack(pady=3, padx=10, fill="x")
-        
-        btn_model_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        btn_model_frame.pack(pady=3, padx=10, fill="x")
-        btn_model_frame.grid_columnconfigure(0, weight=1)
-        btn_model_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkButton(btn_model_frame, text="⭐ Ana Model", width=60, height=30, fg_color="#332B10", text_color="#FFD700", command=self.set_current_as_default).grid(row=0, column=0, padx=(0, 3), sticky="ew")
-        ctk.CTkButton(btn_model_frame, text="↺ Orijinal", width=60, height=30, fg_color="#2A2A2A", command=self.reset_default_robot).grid(row=0, column=1, padx=(3, 0), sticky="ew")
-        
-        self.lbl_default_info = ctk.CTkLabel(self.sidebar, text="Açılış: Fanuc", font=ctk.CTkFont(size=10))
-        self.lbl_default_info.pack(pady=(1, 6))
-
-        # 2. PAGES
-        self.pages_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.pages_frame.grid(row=0, column=1, padx=15, pady=(15, 5), sticky="nsew")
-        self.pages_frame.grid_rowconfigure(0, weight=1)
-        self.pages_frame.grid_columnconfigure(0, weight=1)
-
-        self.page_manual = ManualPage(self.pages_frame, self, self.sim_engine)
-        self.page_fk = FKPage(self.pages_frame, self)
-        self.page_ik = IKPage(self.pages_frame, self, self.kinematics_engine, self.telemetry_engine)
+        # panel + rota şeridi
+        left = ctk.CTkFrame(body, fg_color="transparent", width=344)
+        left.grid(row=0, column=1, sticky="ns", padx=(0, theme.PAD))
+        left.grid_propagate(False)
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+        self.pendant = theme.card(left)
+        self.pendant.grid(row=0, column=0, sticky="nsew")
+        self.pages_frame = ctk.CTkFrame(self.pendant, fg_color="transparent")
+        self.pages_frame.pack(fill="both", expand=True, padx=14, pady=12)
+        self.page_jog = JogPage(self.pages_frame, self, self.sim_engine)
+        self.page_target = TargetPage(self.pages_frame, self, self.kinematics_engine)
         self.page_energy = EnergyPage(self.pages_frame, self, self.telemetry_engine, self.sim_engine)
+        self.page_model = ModelPage(self.pages_frame, self)
+        self.page_settings = SettingsPage(self.pages_frame, self)
+        self.pages = {"jog": self.page_jog, "target": self.page_target, "energy": self.page_energy,
+                      "model": self.page_model, "settings": self.page_settings}
+        # eski adlarla erişen kodlar için
+        self.page_manual = self.page_jog
+        self.timeline = RouteTimeline(left, self.go_to_ik_step, self.execute_trajectory, self.on_blocked_stop)
+        self.timeline.grid(row=1, column=0, sticky="ew", pady=(theme.PAD, 0))
 
-        # 3. ANALYSIS PANEL
-        self.analysis_panel = AnalysisPanel(self)
-        self.analysis_panel.grid(row=0, column=2, padx=10, pady=(15, 5), sticky="nsew")
-
-        # 4. RENDER FRAME
-        self.render_frame = ctk.CTkFrame(self, fg_color="#1A1A1A", corner_radius=12, border_width=1, border_color="#2A2A2A")
-        self.render_frame.grid(row=0, column=3, padx=(0, 15), pady=(15, 5), sticky="nsew")
-        self.render_frame.grid_rowconfigure(0, weight=1)
-        self.render_frame.grid_columnconfigure(0, weight=1)
-
-        self.camera_label = ctk.CTkLabel(self.render_frame, text="Motor Yükleniyor...", text_color="gray", fg_color="transparent")
-        self.camera_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-
+        # sahne: renderer'ın 600x800 karesi, üstüne hiçbir şey çizilmez
+        self.stage = theme.card(body)
+        self.stage.grid(row=0, column=2, sticky="n", padx=(0, theme.PAD))
+        head = ctk.CTkFrame(self.stage, fg_color="transparent")
+        head.pack(fill="x", padx=12, pady=(8, 2))
+        ctk.CTkLabel(head, text=f"— {t('stage.section')}", font=theme.font(11), text_color=theme.MUTED, height=16).pack(side="left")
+        ctk.CTkLabel(head, text=t("stage.hint"), font=theme.font(10), text_color=theme.MUTED, height=16).pack(side="right")
+        self.camera_label = ctk.CTkLabel(self.stage, text="", width=600, height=800, fg_color=theme.BG, corner_radius=0)
+        self.camera_label.pack(padx=8, pady=(0, 8))
         self.camera_label.bind("<ButtonPress-1>", self._on_cam_mouse_down)
         self.camera_label.bind("<B1-Motion>", self._on_cam_mouse_drag)
         self.camera_label.bind("<ButtonPress-3>", self._on_cam_right_down)
         self.camera_label.bind("<B3-Motion>", self._on_cam_right_drag)
         self.camera_label.bind("<MouseWheel>", self._on_cam_mouse_wheel)
+        self.camera_label.bind("<Button-4>", lambda e: self._on_cam_mouse_wheel(type("E", (), {"delta": 120})()))
+        self.camera_label.bind("<Button-5>", lambda e: self._on_cam_mouse_wheel(type("E", (), {"delta": -120})()))
 
-        # 5. GRAPH FRAME
-        self.graph_frame = ctk.CTkFrame(self, fg_color="#1E1E1E", corner_radius=12, border_width=1, border_color="#2A2A2A")
-        self.graph_frame.grid(row=1, column=1, columnspan=3, padx=15, pady=(5, 15), sticky="nsew")
-
-        self.graph_header = ctk.CTkFrame(self.graph_frame, fg_color="transparent")
-        self.graph_header.pack(fill="x", padx=15, pady=(5, 2))
-        self.graph_header.grid_columnconfigure(0, weight=1)
-        self.graph_header.grid_columnconfigure(1, weight=2)
-        self.graph_header.grid_columnconfigure(2, weight=0)
-
-        ctk.CTkLabel(self.graph_header, text="⚡ CANLI MOTOR GÜÇ TÜKETİMİ (WATT)", font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, sticky="w")
-        self.lbl_energy_summary = ctk.CTkLabel(self.graph_header, text="Anlık: 0.0 W", font=ctk.CTkFont(size=11, weight="bold"), text_color="#00FFCC")
-        self.lbl_energy_summary.grid(row=0, column=1, sticky="e", padx=15)
-        
-        ctk.CTkButton(self.graph_header, text="↺ Sıfırla", width=65, height=24, fg_color="#2A2A2A", command=self.reset_energy_counter).grid(row=0, column=2, sticky="e")
-        
-        self.canvas = tk.Canvas(self.graph_frame, bg="#0A0A0A", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        self.side = SidePanel(body, self)
+        self.side.grid(row=0, column=3, sticky="nsew")
 
     # --- ACTIONS ---
     def show_page(self, page_name):
-        self.page_manual.pack_forget()
-        self.page_fk.pack_forget()
-        self.page_ik.pack_forget()
-        self.page_energy.pack_forget()
+        for page in self.pages.values(): page.pack_forget()
         self.current_page = page_name
-
-        if page_name == "manual": self.page_manual.pack(fill="both", expand=True)
-        elif page_name == "fk": self.page_fk.pack(fill="both", expand=True)
-        elif page_name == "ik": self.page_ik.pack(fill="both", expand=True)
-        elif page_name == "energy": self.page_energy.pack(fill="both", expand=True)
+        self.pages[page_name].pack(fill="both", expand=True)
+        for mode, btn in self.mode_buttons.items():
+            on = mode == page_name
+            btn.configure(fg_color=theme.BG3 if on else "transparent", text_color=theme.GOLD if on else theme.MUTED,
+                          border_width=1 if on else 0, border_color=theme.BORDER2)
 
     def toggle_obstacle(self):
         state, msg = self.sim_engine.toggle_obstacle()
         self.status_message = msg
+        self.side.set_obstacle(self.sim_engine.obstacle_id is not None)
 
     def randomize_obstacle(self):
         self.status_message = self.sim_engine.randomize_obstacle()
+        self.side.set_obstacle(True)
+
+    def press_estop(self):
+        # Üst çubuktaki mantar buton; zaten aktifse bir şey yapmaz, sıfırlama 'Sıfırla' ile
+        if not self.sim_engine.e_stop_active and self.sim_engine.robotId is not None:
+            self.trigger_estop(t("estop.manual"))
+
+    def reset_camera(self):
+        home = getattr(self, "camera_home", None)
+        if not home: return
+        with self.gpu_state_lock: self.gpu_shared_state.update(home)
+
+    def set_language(self, lang):
+        cfg = self.load_config()
+        cfg["language"] = lang
+        self.save_config(cfg)
+        self.status_message = t("settings.language_hint")
 
     def reset_estop(self):
         self.estop_reason = None
         with self.data_lock:
             self.status_message = self.sim_engine.reset_estop(self.shared_targets)
             for var in self.page_manual.slider_vars: var.set(0.0)
+        self.side.set_obstacle(False)
 
     def toggle_workspace(self):
         state = self.kinematics_engine.toggle_workspace()
-        self.btn_nav_workspace.configure(text="Saydam İzi Temizle" if state else "Saydam İzi Göster")
+        self.side.set_trail(state)
 
     def apply_energy_settings(self):
         page = self.page_energy
@@ -248,7 +255,7 @@ class RobotKontrolApp(ctk.CTk):
 
     def trigger_fk_calculation(self):
         log = self.kinematics_engine.calculate_fk()
-        self.analysis_panel.update_report(log)
+        self.side.set_report(log)
         self.save_position()
 
     def trigger_ik_calculation(self, x_val, y_val, z_val):
@@ -256,9 +263,20 @@ class RobotKontrolApp(ctk.CTk):
             current_angles = [float(v.get()) for v in self.page_manual.slider_vars]
             
         log, has_risk, err, desc = self.kinematics_engine.calculate_ik(x_val, y_val, z_val, current_angles)
-        self.analysis_panel.update_report(log)
-        self.page_ik.rebuild_waypoints(self.kinematics_engine.pending_waypoints, err, has_risk, desc)
-        
+        self.side.set_report(log)
+        k = self.kinematics_engine
+        safety = k.pending_waypoint_safety if len(k.pending_waypoint_safety) == len(k.pending_waypoints) else \
+            [k.check_angles_safety(wp) for wp in k.pending_waypoints]
+        if err > 0.03:
+            safety = [(False, f"{err * 100:.1f} cm")] * len(safety)
+        playable = not has_risk and err <= 0.03
+        coords = dict(x=x_val or "?", y=y_val or "?", z=z_val or "?")
+        if not playable: summary = t("route.summary_blocked", **coords)
+        elif len(k.pending_waypoints) > 1: summary = t("route.summary_detour", n=len(k.pending_waypoints), **coords)
+        else: summary = t("route.summary_direct", **coords)
+        self.timeline.set_route(k.pending_waypoint_labels, safety, getattr(k, "route_segment_energy", []), summary,
+                                playable, k.time_fast, k.time_eco)
+
         if has_risk or err > 0.03:
             fail_reason = desc if has_risk else f"Hedef Ulaşılamaz ({err * 100:.1f} cm sapma)"
             self.status_message = f"UYARI: {fail_reason}! Hareket kilitlendi."
@@ -280,9 +298,8 @@ class RobotKontrolApp(ctk.CTk):
             return
 
         # Bitince butonlar önceki hâline döner (ör. riskli rotada kilitli kalmaya devam etmeli)
-        self.traj_btn_states = (self.page_ik.btn_fast_traj.cget("state"), self.page_ik.btn_eco_traj.cget("state"))
-        self.page_ik.btn_fast_traj.configure(state="disabled")
-        self.page_ik.btn_eco_traj.configure(state="disabled")
+        self.traj_btn_states = self.timeline.play_states()
+        self.timeline.set_play_enabled(False)
         self.status_message = status_text
 
         with self.data_lock:
@@ -346,6 +363,9 @@ class RobotKontrolApp(ctk.CTk):
                 return idx
         return None
 
+    def on_blocked_stop(self, idx, reason):
+        self.status_message = t("route.blocked", n=idx + 1, reason=reason)
+
     def go_to_ik_step(self, target_idx):
         waypoints = self.kinematics_engine.pending_waypoints
         if not 0 <= target_idx < len(waypoints): return
@@ -406,8 +426,23 @@ class RobotKontrolApp(ctk.CTk):
         page.entry_robot_mass.delete(0, "end")
         page.entry_robot_mass.insert(0, f"{self.telemetry_engine.robot_mass_default:.1f}")
         source = self.telemetry_engine.mass_source
-        page.lbl_mass_source.configure(text=f"Robot kütlesi: {source}" + (" (ρ=1.5 t/m³)" if "tahmini" in source else ""))
+        page.lbl_mass_source.configure(text=t("energy.mass_source", source=source) + (t("energy.density_note") if "tahmini" in source else ""))
         self.apply_energy_settings()
+
+        # Model bilgisi (üst çubuk ve Model paneli), kamera başlangıcı, eski rota temizlenir
+        path = getattr(self, "current_source_path", None) or self.builtin_urdf_path
+        is_builtin = os.path.normpath(path) == os.path.normpath(self.builtin_urdf_path)
+        name = t("model.builtin_name") if is_builtin else os.path.splitext(os.path.basename(path))[0].replace(".urdf", "")
+        tel, kin = self.telemetry_engine, self.kinematics_engine
+        n_axes = len(self.sim_engine.revolute_joints)
+        self.lbl_model_line.configure(text=f"— {name} · {t('topbar.axes', n=n_axes)} · {tel.robot_mass_kg:.1f} kg")
+        self.page_model.update_info(name, os.path.basename(path), n_axes, tel.robot_mass_kg, tel.mass_source, kin.robot_reach_cm)
+        with self.gpu_state_lock:
+            self.camera_home = {k: self.gpu_shared_state.get(k) for k in ("cam_dist", "cam_target", "cam_yaw", "cam_pitch")}
+        kin.pending_waypoints, kin.pending_waypoint_labels, kin.pending_waypoint_safety = [], [], []
+        self.timeline.clear()
+        self.side.set_obstacle(self.sim_engine.obstacle_id is not None)
+        self.status_message = t("status.model_loaded", name=name, n=n_axes)
 
         # Hedef listesi ve konum geçmişi modelin eksen sayısına göre yeniden boyutlanır;
         # sabit 6 elemanlı liste 7. ve sonraki eksenlere (ör. gripper) komut gitmesini engelliyordu.
@@ -417,8 +452,8 @@ class RobotKontrolApp(ctk.CTk):
             self.position_history = [[0.0] * n_joints]
             self.history_idx = 0
         self.page_manual.rebuild_joint_sliders(self.sim_engine.revolute_joints, self.sim_engine.robotId, self.make_scroll_smooth)
-        self.page_ik.update_limits()
-        self.sliders_locked = None  # yeni slider'lara kilit durumu bir sonraki UI tick'inde uygulanır
+        self.page_target.update_limits()
+        self._estop_ui = None  # yeni eksen satırlarına E-stop kilidi bir sonraki UI tick'inde uygulanır
 
     def save_position(self):
         current_pos = [var.get() for var in self.page_manual.slider_vars]
@@ -473,11 +508,8 @@ class RobotKontrolApp(ctk.CTk):
             dist = float(self.gpu_shared_state.get('cam_dist', 1.8))
             self.gpu_shared_state['cam_dist'] = max(0.3, min(40.0, dist * (1.12 ** (-event.delta / 120.0))))
 
-    def set_render_quality(self, value):
-        preset_map = {"Standard (600p)": "standard", "HD (1.5× SS)": "hd", "FHD (2× SS)": "fhd"}
-        preset = preset_map.get(value, "standard")
+    def set_render_quality(self, preset):
         with self.gpu_state_lock: self.gpu_shared_state['preset'] = preset
-        self.lbl_qual_info.configure(text={"standard": "600p native · 60 FPS", "hd": "1.5× SS · 60 FPS", "fhd": "2× SS · 60 FPS"}[preset])
 
     # --- URDF LOADING ---
     def load_config(self):
@@ -498,10 +530,9 @@ class RobotKontrolApp(ctk.CTk):
     def update_default_model_label(self):
         saved = self.load_config().get("default_model_path")
         if saved and os.path.isfile(saved):
-            name = os.path.splitext(os.path.basename(saved))[0][:14] + ".."
-            self.lbl_default_info.configure(text=f"Açılış: {name} ⭐", text_color="#FFD700")
+            self.page_model.set_default_info(t("model.default_custom", name=os.path.basename(saved)), True)
         else:
-            self.lbl_default_info.configure(text="Açılış: Fanuc (Dahili)", text_color="#777777")
+            self.page_model.set_default_info(t("model.default_builtin"), False)
 
     def open_urdf_file_dialog(self):
         fp = filedialog.askopenfilename(filetypes=[("Modeller", "*.urdf;*.xacro")])
@@ -524,6 +555,7 @@ class RobotKontrolApp(ctk.CTk):
         cfg["default_model_path"] = None
         self.save_config(cfg)
         self.robot_loader.load_robot_model(self.builtin_urdf_path)
+        self.current_source_path = self.builtin_urdf_path
         self.update_default_model_label()
         self.on_model_loaded()
 
@@ -544,8 +576,7 @@ class RobotKontrolApp(ctk.CTk):
 
             # E-Stop and Safety check natively inside step simulation or handled externally?
             # We decoupled check_angles_safety, but here we just step
-            if not self.sim_engine.e_stop_active:
-                self.telemetry_engine.calculate_power_tick(dt)
+            self.telemetry_engine.calculate_power_tick(dt)
 
             # Sabit adımlı fizik: duvar saatinde geçen süre x SIM_SPEED kadar simülasyon
             accumulator += dt * SIM_SPEED
@@ -627,14 +658,14 @@ class RobotKontrolApp(ctk.CTk):
                 for i in range(min(n_vars, len(self.shared_targets))):
                     self.shared_targets[i] = self.page_manual.slider_vars[i].get()
 
+        self.page_jog.redraw_gauges()
+
         # Slider'lar yukarıda son hedeflere eşitlendi; kayıt ondan sonra, oynatma bayrağı en son kapanır
         if getattr(self, "trajectory_finished", False):
             self.trajectory_finished = False
             self.save_position()
             self.is_trajectory_playing = False
-            fast_state, eco_state = getattr(self, "traj_btn_states", ("normal", "normal"))
-            self.page_ik.btn_fast_traj.configure(state=fast_state)
-            self.page_ik.btn_eco_traj.configure(state=eco_state)
+            self.timeline.restore_play_states(getattr(self, "traj_btn_states", ("normal", "normal")))
 
         img = None
         while not self.q_img.empty():
@@ -644,39 +675,52 @@ class RobotKontrolApp(ctk.CTk):
             self.tk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(600, 800))
             self.camera_label.configure(image=self.tk_img, text="")
 
-        self.analysis_panel.set_estop_state(self.sim_engine.e_stop_active)
-        if self.sim_engine.e_stop_active:
+        estop = self.sim_engine.e_stop_active
+        if estop:
             reason = getattr(self, "estop_reason", None) or "ÇARPIŞMA TESPİT EDİLDİ"
-            self.status_message = f"!!! E-STOP: {reason} - MOTORLAR KİLİTLENDİ !!!"
-        if self.sim_engine.e_stop_active != getattr(self, "sliders_locked", None):
-            self.sliders_locked = self.sim_engine.e_stop_active
-            for slider in self.page_manual.sliders:
-                slider.configure(state="disabled" if self.sliders_locked else "normal")
+            self.status_message = f"E-STOP: {reason}"
+        self._apply_estop_ui(estop)
 
-        # Telemetry updates (Mockup for original system)
-        telemetry_text = f"Motor Verimi: %{self.telemetry_engine.motor_efficiency*100:.0f}\nYük: {self.telemetry_engine.payload_kg:.1f} kg | Robot: {self.telemetry_engine.robot_mass_kg:.0f} kg\nDurum: {self.status_message}"
-        self.analysis_panel.update_telemetry(telemetry_text)
+        playing = getattr(self, "is_trajectory_playing", False)
+        level = "err" if estop else ("busy" if playing else ("warn" if self.status_message.upper().startswith("UYARI") else "ok"))
+        self.side.set_status(self.status_message, level)
+        pill = {"err": ("pill.estop", theme.ERR), "busy": ("pill.moving", theme.STEEL), "warn": ("pill.warning", theme.WARN),
+                "ok": ("pill.ready", theme.OK)}[level]
+        if getattr(self, "_pill", None) != pill:
+            self._pill = pill
+            self.lbl_pill.configure(text=t(pill[0]), text_color=pill[1])
 
-        # Graph updates
-        kwh_val = self.telemetry_engine.cumulative_energy_kwh
-        cost_val = self.telemetry_engine.cumulative_cost_tl
-        pow_val = self.telemetry_engine.current_power
-        self.lbl_energy_summary.configure(text=f"Anlık: {pow_val:5.1f} W  |  Sayaç: {kwh_val:.4f} kWh  |  Maliyet: {cost_val:.3f} TL")
-        
-        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
-        self.canvas.delete("all")
-        self.canvas.create_line(0, h / 2, w, h / 2, fill="#333333", dash=(4, 4))
-        history = self.telemetry_engine.power_history
-        max_power = max(200.0, max(history) * 1.2) if history else 200.0
-        self.canvas.create_text(10, 10, text=f"Max: {max_power:.0f} W", fill="#666666", anchor="nw")
-        
-        points = []
-        for i, val in enumerate(history):
-            points.extend([(i / 100.0) * w, h - ((val / max_power) * h)])
-        if len(points) >= 4:
-            self.canvas.create_line(*points, fill="#FF3333" if self.sim_engine.e_stop_active else "#00FF66", width=2, smooth=True)
+        tel = self.telemetry_engine
+        self.side.update_power(tel.current_power, tel.cumulative_energy_kwh, tel.cumulative_cost_tl, tel.power_history, estop)
+
+        # ~5 Hz: uç konumu, rota şeridindeki konum, hedef haritası
+        if self.gc_ticks % 6 == 0 and self.sim_engine.robotId is not None:
+            with self.sim_engine.bullet_lock:
+                tcp = [v * 100 for v in p.getLinkState(self.sim_engine.robotId, self.sim_engine.end_effector_index)[4]]
+            self.side.set_tcp(tcp)
+            self.side.set_load(tel.payload_kg, tel.robot_mass_kg)
+            waypoints = self.kinematics_engine.pending_waypoints
+            if waypoints:
+                with self.data_lock: current = list(self.shared_targets)
+                self.timeline.set_position(self.route_position(current, waypoints))
+            if self.current_page == "target":
+                obs = None
+                if self.sim_engine.obstacle_id is not None:
+                    o, h = self.sim_engine.obstacle_pos, self.sim_engine.obstacle_half
+                    obs = (round(o[0] * 100, 1), round(o[1] * 100, 1), round(h[0] * 100, 1), round(h[1] * 100, 1))
+                self.page_target.refresh_map(tcp, obs)
 
         self.after(30, self.update_ui_loop)
+
+    def _apply_estop_ui(self, estop):
+        """E-stop görünümü sadece durum değişince güncellenir (kart yeniden çizimi pahalı)."""
+        if estop == getattr(self, "_estop_ui", None): return
+        self._estop_ui = estop
+        self.estop_btn.set_active(estop)
+        self.stage.configure(border_color=theme.ERR if estop else theme.BORDER, border_width=2 if estop else 1)
+        self.page_jog.set_locked(estop)
+        if estop: self.btn_reset_estop.pack(side="right", padx=(0, 10), before=self.estop_btn)
+        else: self.btn_reset_estop.pack_forget()
 
     def on_closing(self):
         self.is_running = False

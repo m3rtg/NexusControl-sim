@@ -300,7 +300,10 @@ class TelemetryEngine:
             if self.sim_engine.robotId is None: return
 
             playback = self._playback
-            if playback is not None and time.perf_counter() - playback[0] < 0.2:
+            if self.sim_engine.e_stop_active:
+                # Motorlar kilitli, fizik adımlanmıyor: sadece bekleme gücü (eskiden son değer donup kalıyordu)
+                velocities = torques = [0.0] * len(self.sim_engine.revolute_joints)
+            elif playback is not None and time.perf_counter() - playback[0] < 0.2:
                 velocities, torques = playback[1], playback[2]
             else:
                 joint_states = p.getJointStates(self.sim_engine.robotId, self.sim_engine.revolute_joints)
