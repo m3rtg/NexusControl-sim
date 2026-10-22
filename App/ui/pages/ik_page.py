@@ -56,56 +56,6 @@ class IKPage(ctk.CTkScrollableFrame):
         )
         self.lbl_reach_status.pack(fill="x", pady=(4, 10), padx=15)
 
-        # --- MOTOR, YÜK & MALİYET AYARLARI KARTI ---
-        motor_card = ctk.CTkFrame(self, fg_color="#242424", corner_radius=10)
-        motor_card.pack(fill="x", pady=(0, 10))
-
-        lbl_motor_title = ctk.CTkLabel(
-            motor_card, text="⚙️ YÜK VE ENERJİ AYARLARI",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color="#FFB300"
-        )
-        lbl_motor_title.pack(pady=(8, 4), padx=15, anchor="w")
-
-        row1 = ctk.CTkFrame(motor_card, fg_color="transparent")
-        row1.pack(fill="x", padx=15, pady=(2, 4))
-        row1.grid_columnconfigure(0, weight=1)
-        row1.grid_columnconfigure(1, weight=1)
-
-        p_frame = ctk.CTkFrame(row1, fg_color="transparent")
-        p_frame.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        ctk.CTkLabel(p_frame, text="Yük (Payload - kg):", font=ctk.CTkFont(size=11), text_color="#AAAAAA").pack(anchor="w")
-        self.entry_payload = ctk.CTkEntry(p_frame, placeholder_text="0.0", height=32)
-        self.entry_payload.insert(0, "0.0")
-        self.entry_payload.pack(fill="x", pady=(2, 0))
-
-        t_frame = ctk.CTkFrame(row1, fg_color="transparent")
-        t_frame.grid(row=0, column=1, sticky="ew", padx=(5, 0))
-        ctk.CTkLabel(t_frame, text="Tarife (TL / kWh):", font=ctk.CTkFont(size=11), text_color="#AAAAAA").pack(anchor="w")
-        self.entry_tariff = ctk.CTkEntry(t_frame, placeholder_text="4.50", height=32)
-        self.entry_tariff.insert(0, "4.50")
-        self.entry_tariff.pack(fill="x", pady=(2, 0))
-
-        row2 = ctk.CTkFrame(motor_card, fg_color="transparent")
-        row2.pack(fill="x", padx=15, pady=(2, 8))
-        row2.grid_columnconfigure(0, weight=1)
-        row2.grid_columnconfigure(1, weight=1)
-
-        eff_frame = ctk.CTkFrame(row2, fg_color="transparent")
-        eff_frame.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        ctk.CTkLabel(eff_frame, text="Motor Verimi (%):", font=ctk.CTkFont(size=11), text_color="#AAAAAA").pack(anchor="w")
-        self.entry_efficiency = ctk.CTkEntry(eff_frame, placeholder_text="85", height=32)
-        self.entry_efficiency.insert(0, "85")
-        self.entry_efficiency.pack(fill="x", pady=(2, 0))
-
-        self.btn_apply_payload = ctk.CTkButton(
-            row2, text="⚡ Güncelle", height=32, corner_radius=6,
-            fg_color="#332B10", hover_color="#4A3E14", text_color="#FFD700",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            command=self.on_apply_payload
-        )
-        self.btn_apply_payload.grid(row=0, column=1, sticky="se", padx=(5, 0))
-
         self.btn_calc_ik = ctk.CTkButton(self, text="Yörünge ve Rotayı Hesapla", height=42, corner_radius=8,
                                          command=self.on_calculate_ik)
         self.btn_calc_ik.pack(pady=(5, 10), fill="x")
@@ -132,16 +82,9 @@ class IKPage(ctk.CTkScrollableFrame):
         self.ik_steps_frame = ctk.CTkFrame(self, fg_color="#242424", corner_radius=10)
         self.ik_steps_frame.pack(fill="x", padx=10, pady=(0, 15))
 
-    def on_apply_payload(self):
-        msg = self.telemetry.apply_payload_settings(
-            self.entry_payload.get(),
-            self.entry_tariff.get(),
-            self.entry_efficiency.get()
-        )
-        self.app.status_message = msg
-
     def on_calculate_ik(self):
-        self.on_apply_payload()
+        # Yük ve enerji ayarları soldaki menüde; hesaplamadan önce güncel değerler uygulanır
+        self.app.apply_energy_settings()
         self.app.trigger_ik_calculation(
             self.entry_x.get(), 
             self.entry_y.get(), 

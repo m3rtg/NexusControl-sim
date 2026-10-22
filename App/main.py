@@ -19,6 +19,7 @@ from core.robot_loader import RobotLoader
 from ui.pages.manual_page import ManualPage
 from ui.pages.fk_page import FKPage
 from ui.pages.ik_page import IKPage
+from ui.pages.energy_page import EnergyPage
 from ui.widgets.analysis_panel import AnalysisPanel
 from render_engine import RobotGPURenderer
 
@@ -107,7 +108,10 @@ class RobotKontrolApp(ctk.CTk):
         self.grid_columnconfigure(3, weight=4, minsize=320)
 
         # 1. NAVBAR
-        self.sidebar = ctk.CTkFrame(self, corner_radius=0, fg_color="#141414")
+        # Kaydırılabilir: içerik ~690 px; küçük ekranlarda/ölçeklemede alt kısım kesilmesin
+        # Genişlik eski sabit çerçevenin içerikten aldığı ~306 px; varsayılan 200 px butonları kesiyordu
+        self.sidebar = ctk.CTkScrollableFrame(self, corner_radius=0, fg_color="#141414", width=286,
+                                              scrollbar_button_color="#2A2A2A", scrollbar_button_hover_color="#3A3A3A")
         self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
 
         logo_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -118,6 +122,7 @@ class RobotKontrolApp(ctk.CTk):
         ctk.CTkButton(self.sidebar, text="Manuel Kontrol", height=40, command=lambda: self.show_page("manual")).pack(pady=8, padx=10, fill="x")
         ctk.CTkButton(self.sidebar, text="İleri Kinematik", height=40, command=lambda: self.show_page("fk")).pack(pady=8, padx=10, fill="x")
         ctk.CTkButton(self.sidebar, text="Ters Kinematik", height=40, command=lambda: self.show_page("ik")).pack(pady=8, padx=10, fill="x")
+        ctk.CTkButton(self.sidebar, text="Güç ve Enerji", height=40, command=lambda: self.show_page("energy")).pack(pady=8, padx=10, fill="x")
         
         self.btn_nav_workspace = ctk.CTkButton(self.sidebar, text="Saydam İzi Göster", height=40, fg_color="#005A9E", command=self.toggle_workspace)
         self.btn_nav_workspace.pack(pady=(20, 8), padx=10, fill="x")
@@ -126,8 +131,8 @@ class RobotKontrolApp(ctk.CTk):
         obs_frame.pack(pady=8, padx=10, fill="x")
         obs_frame.grid_columnconfigure(0, weight=3)
         obs_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkButton(obs_frame, text="Engel Aç/Kapat", height=40, fg_color="#D2691E", command=self.toggle_obstacle).grid(row=0, column=0, padx=(0, 5), sticky="ew")
-        ctk.CTkButton(obs_frame, text="Rastgele", height=40, fg_color="#555555", command=self.randomize_obstacle).grid(row=0, column=1, sticky="ew")
+        ctk.CTkButton(obs_frame, text="Engel Aç/Kapat", width=60, height=40, fg_color="#D2691E", command=self.toggle_obstacle).grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        ctk.CTkButton(obs_frame, text="Rastgele", width=60, height=40, fg_color="#555555", command=self.randomize_obstacle).grid(row=0, column=1, sticky="ew")
 
         ctk.CTkButton(self.sidebar, text="E-STOP SIFIRLA", height=40, fg_color="#8B0000", command=self.reset_estop).pack(pady=(20, 8), padx=10, fill="x")
 
@@ -144,8 +149,8 @@ class RobotKontrolApp(ctk.CTk):
         btn_model_frame.pack(pady=3, padx=10, fill="x")
         btn_model_frame.grid_columnconfigure(0, weight=1)
         btn_model_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkButton(btn_model_frame, text="⭐ Ana Model", height=30, fg_color="#332B10", text_color="#FFD700", command=self.set_current_as_default).grid(row=0, column=0, padx=(0, 3), sticky="ew")
-        ctk.CTkButton(btn_model_frame, text="↺ Orijinal", height=30, fg_color="#2A2A2A", command=self.reset_default_robot).grid(row=0, column=1, padx=(3, 0), sticky="ew")
+        ctk.CTkButton(btn_model_frame, text="⭐ Ana Model", width=60, height=30, fg_color="#332B10", text_color="#FFD700", command=self.set_current_as_default).grid(row=0, column=0, padx=(0, 3), sticky="ew")
+        ctk.CTkButton(btn_model_frame, text="↺ Orijinal", width=60, height=30, fg_color="#2A2A2A", command=self.reset_default_robot).grid(row=0, column=1, padx=(3, 0), sticky="ew")
         
         self.lbl_default_info = ctk.CTkLabel(self.sidebar, text="Açılış: Fanuc", font=ctk.CTkFont(size=10))
         self.lbl_default_info.pack(pady=(1, 6))
@@ -159,6 +164,7 @@ class RobotKontrolApp(ctk.CTk):
         self.page_manual = ManualPage(self.pages_frame, self, self.sim_engine)
         self.page_fk = FKPage(self.pages_frame, self)
         self.page_ik = IKPage(self.pages_frame, self, self.kinematics_engine, self.telemetry_engine)
+        self.page_energy = EnergyPage(self.pages_frame, self, self.telemetry_engine, self.sim_engine)
 
         # 3. ANALYSIS PANEL
         self.analysis_panel = AnalysisPanel(self)
@@ -203,11 +209,13 @@ class RobotKontrolApp(ctk.CTk):
         self.page_manual.pack_forget()
         self.page_fk.pack_forget()
         self.page_ik.pack_forget()
+        self.page_energy.pack_forget()
         self.current_page = page_name
 
         if page_name == "manual": self.page_manual.pack(fill="both", expand=True)
         elif page_name == "fk": self.page_fk.pack(fill="both", expand=True)
         elif page_name == "ik": self.page_ik.pack(fill="both", expand=True)
+        elif page_name == "energy": self.page_energy.pack(fill="both", expand=True)
 
     def toggle_obstacle(self):
         state, msg = self.sim_engine.toggle_obstacle()
@@ -225,6 +233,15 @@ class RobotKontrolApp(ctk.CTk):
     def toggle_workspace(self):
         state = self.kinematics_engine.toggle_workspace()
         self.btn_nav_workspace.configure(text="Saydam İzi Temizle" if state else "Saydam İzi Göster")
+
+    def apply_energy_settings(self):
+        page = self.page_energy
+        self.telemetry_engine.apply_motor_settings(page.motor_settings())
+        self.status_message = self.telemetry_engine.apply_payload_settings(
+            page.entry_payload.get(), page.entry_tariff.get(), page.entry_efficiency.get(), page.entry_robot_mass.get())
+        page.entry_robot_mass.delete(0, "end")
+        page.entry_robot_mass.insert(0, f"{self.telemetry_engine.robot_mass_kg:.1f}")
+        page.show_motor_summary()
 
     def reset_energy_counter(self):
         self.status_message = self.telemetry_engine.reset_energy_counter()
@@ -280,7 +297,16 @@ class RobotKontrolApp(ctk.CTk):
         # Tek süre verilirse segmentlere eşit bölünür; liste verilirse her segmentin kendi süresi
         durations = total_duration if isinstance(total_duration, list) else [total_duration / num_waypoints] * num_waypoints
         current = start_angles
+        try:
+            self._play_waypoints(strategy, waypoints, current, durations)
+        finally:
+            self.telemetry_engine.clear_playback_state()
 
+        if not self.sim_engine.e_stop_active: self.status_message = f"Robot hedefe başarıyla yerleşti!"
+        # Tk thread-safe değil: kayıt ve buton güncellemesi update_ui_loop'ta (ana thread) yapılır
+        self.trajectory_finished = True
+
+    def _play_waypoints(self, strategy, waypoints, current, durations):
         for wp_idx, target_angles in enumerate(waypoints):
             duration_per_wp = durations[wp_idx]
             steps = int(max(duration_per_wp * 30, 5))
@@ -288,15 +314,17 @@ class RobotKontrolApp(ctk.CTk):
 
             for step in range(1, steps + 1):
                 if self.sim_engine.e_stop_active: break
-                t = step / steps
-                factor = t if strategy == "fast" else (1 - math.cos(math.pi * t)) / 2.0
-                angles = [c + (tr - c) * factor for c, tr in zip(current, target_angles)]
+                angles, qd, qdd = self.kinematics_engine.profile_state(current, target_angles, duration_per_wp, strategy, step / steps)
 
                 with self.sim_engine.bullet_lock:
                     if self.sim_engine.e_stop_active: break
                     for i, joint_idx in enumerate(self.sim_engine.revolute_joints):
                         if i < len(angles): p.resetJointState(self.sim_engine.robotId, joint_idx, angles[i])
                     if self.kinematics_engine.show_workspace: self.kinematics_engine.draw_swept_volume()
+                    # Eklemler doğrudan konumlandığı için fizik tork görmez; güç grafiği ters dinamikten beslenir
+                    if len(angles) == len(self.sim_engine.revolute_joints) and self.telemetry_engine.dynamics_ok:
+                        tau = self.telemetry_engine.joint_torques(angles, qd, qdd)
+                        self.telemetry_engine.set_playback_state(qd, tau)
 
                 with self.data_lock:
                     if self.sim_engine.e_stop_active: break
@@ -307,10 +335,6 @@ class RobotKontrolApp(ctk.CTk):
 
             if self.sim_engine.e_stop_active: break
             current = target_angles
-
-        if not self.sim_engine.e_stop_active: self.status_message = f"Robot hedefe başarıyla yerleşti!"
-        # Tk thread-safe değil: kayıt ve buton güncellemesi update_ui_loop'ta (ana thread) yapılır
-        self.trajectory_finished = True
 
     def route_position(self, angles, waypoints):
         """Robot rotadaki bir waypoint'te duruyorsa onun indeksi, değilse None. Sadece TCP zincirindeki
@@ -376,6 +400,15 @@ class RobotKontrolApp(ctk.CTk):
         if canvas: canvas.bind("<MouseWheel>", _on_wheel, add="+")
 
     def on_model_loaded(self):
+        # Yeni modelin kendi ağırlığı alana yazılır; yük, tarife ve motor alanları korunur ve yeni gövdeye uygulanır
+        page = self.page_energy
+        page.rebuild_axis_rows()
+        page.entry_robot_mass.delete(0, "end")
+        page.entry_robot_mass.insert(0, f"{self.telemetry_engine.robot_mass_default:.1f}")
+        source = self.telemetry_engine.mass_source
+        page.lbl_mass_source.configure(text=f"Robot kütlesi: {source}" + (" (ρ=1.5 t/m³)" if "tahmini" in source else ""))
+        self.apply_energy_settings()
+
         # Hedef listesi ve konum geçmişi modelin eksen sayısına göre yeniden boyutlanır;
         # sabit 6 elemanlı liste 7. ve sonraki eksenlere (ör. gripper) komut gitmesini engelliyordu.
         n_joints = len(self.sim_engine.revolute_joints)
@@ -524,6 +557,7 @@ class RobotKontrolApp(ctk.CTk):
             if not self.sim_engine.e_stop_active and (current_time - last_safety_time >= 0.05):
                 last_safety_time = current_time
                 reason = self.kinematics_engine.detect_collision(check_floor=getattr(self, "is_trajectory_playing", False))
+                if not reason: reason = self.telemetry_engine.detect_overload(targets)
                 if reason: self.trigger_estop(reason)
 
             if self.kinematics_engine.show_workspace and (current_time - last_swept_time >= (1.0 / 15.0)):
@@ -620,7 +654,7 @@ class RobotKontrolApp(ctk.CTk):
                 slider.configure(state="disabled" if self.sliders_locked else "normal")
 
         # Telemetry updates (Mockup for original system)
-        telemetry_text = f"Motor Verimi: %{self.telemetry_engine.motor_efficiency*100:.0f}\nYük: {self.telemetry_engine.payload_kg:.1f} kg\nDurum: {self.status_message}"
+        telemetry_text = f"Motor Verimi: %{self.telemetry_engine.motor_efficiency*100:.0f}\nYük: {self.telemetry_engine.payload_kg:.1f} kg | Robot: {self.telemetry_engine.robot_mass_kg:.0f} kg\nDurum: {self.status_message}"
         self.analysis_panel.update_telemetry(telemetry_text)
 
         # Graph updates

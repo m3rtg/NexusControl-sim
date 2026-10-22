@@ -7,6 +7,23 @@ import threading
 # Sınırsız büyümemesi için en eski segmentler atılır.
 MAX_TRAIL_SEGMENTS = 4000
 
+# Hızlı rotada hızlanma ve yavaşlama, segment süresinin bu oranı kadar sürer (trapez hız profili)
+TRAPEZOID_BLEND = 0.2
+
+def motion_profile(strategy, u):
+    """Segment içinde normalize zaman u (0..1) -> (s, ds/du, d²s/du²), s = alınan yolun oranı.
+    Hızlı: trapez hız profili. Eko: S-eğrisi. Oynatıcı ve enerji tahmini aynı profili kullanır."""
+    if strategy == "fast":
+        a = TRAPEZOID_BLEND
+        v = 1.0 / (1.0 - a)
+        if u < a:
+            return 0.5 * v / a * u * u, v * u / a, v / a
+        if u > 1.0 - a:
+            w = 1.0 - u
+            return 1.0 - 0.5 * v / a * w * w, v * w / a, -v / a
+        return v * (u - 0.5 * a), v, 0.0
+    return (1.0 - math.cos(math.pi * u)) / 2.0, 0.5 * math.pi * math.sin(math.pi * u), 0.5 * math.pi ** 2 * math.cos(math.pi * u)
+
 class KinematicsEngine:
     def __init__(self, sim_engine, telemetry_engine):
         self.sim_engine = sim_engine
@@ -216,6 +233,35 @@ class KinematicsEngine:
                 for i, j_idx in enumerate(self.sim_engine.revolute_joints):
                     p.resetJointState(self.sim_engine.robotId, j_idx, original_states[i][0], original_states[i][1])
 
+    def profile_state(self, start, end, seg_duration, strategy, u):
+        """Oynatıcının segmentteki u anındaki eklem konumu, hızı ve ivmesi."""
+        s, ds, dds = motion_profile(strategy, u)
+        d = [b - a for a, b in zip(start, end)]
+        q = [a + di * s for a, di in zip(start, d)]
+        qd = [di * ds / seg_duration for di in d]
+        qdd = [di * dds / seg_duration ** 2 for di in d]
+        return q, qd, qdd
+
+    def estimate_route_energy(self, start, waypoints, total_duration, strategy, samples=40):
+        """Rotayı oynatıcının izleyeceği şekilde (eşit süreli segmentler, aynı hız profili) örnekler; her an
+        için gereken eklem torkunu ters dinamikle (robot ve yük kütleleriyle) hesaplar. -> (enerji J, tepe güç W)"""
+        robot, n = self.sim_engine.robotId, len(self.sim_engine.revolute_joints)
+        self.last_peak_torques = [0.0] * n
+        if robot is None or not waypoints or total_duration <= 0 or not self.telemetry.dynamics_ok: return 0.0, 0.0
+        seg = total_duration / len(waypoints)
+        energy, peak, prev = 0.0, 0.0, list(start)[:n]
+        with self.sim_engine.bullet_lock:
+            for wp in waypoints:
+                for k in range(samples):
+                    q, qd, qdd = self.profile_state(prev, wp, seg, strategy, (k + 0.5) / samples)
+                    tau = self.telemetry.joint_torques(q, qd, qdd)
+                    power = self.telemetry.electrical_power(qd, tau)
+                    energy += power * seg / samples
+                    peak = max(peak, power)
+                    self.last_peak_torques = [max(a, abs(b)) for a, b in zip(self.last_peak_torques, tau)]
+                prev = list(wp)
+        return energy, peak
+
     def calculate_ik(self, x_val, y_val, z_val, current_joint_angles):
         x_cm = float(x_val) if x_val else (self.robot_reach_cm * 0.45)
         y_cm = float(y_val) if y_val else 0.0
@@ -395,20 +441,13 @@ class KinematicsEngine:
         tariff = self.telemetry.electricity_rate
         standby_total_w = self.telemetry.motor_standby_w * n_joints
 
-        load_power_mult = 1.0 + (0.75 * load_ratio)
-        self.peak_power_fast = (max_deg * 12.0 + 50.0) * load_power_mult
-        self.peak_power_eco = self.peak_power_fast * 0.38
-
-        p_avg_fast_elec = (self.peak_power_fast * 0.55 / eff) + standby_total_w
-        energy_fast_joules = p_avg_fast_elec * self.time_fast
-        cost_fast_kwh = energy_fast_joules / 3.6e6
-        cost_fast_tl = cost_fast_kwh * tariff
-
-        p_avg_eco_elec = (self.peak_power_eco * 0.42 / eff) + standby_total_w
-        energy_eco_joules = p_avg_eco_elec * self.time_eco
-        cost_eco_kwh = energy_eco_joules / 3.6e6
-        cost_eco_tl = cost_eco_kwh * tariff
-        saving_pct = max(0.0, (1.0 - (cost_eco_tl / max(1e-6, cost_fast_tl))) * 100.0)
+        # Enerji: rota iki hız profiliyle ters dinamikten (robot + yük kütlesi) hesaplanır
+        energy_fast_joules, self.peak_power_fast = self.estimate_route_energy(current_joint_angles, self.pending_waypoints, self.time_fast, "fast")
+        peak_tau_fast = list(self.last_peak_torques)
+        energy_eco_joules, self.peak_power_eco = self.estimate_route_energy(current_joint_angles, self.pending_waypoints, self.time_eco, "eco")
+        peak_tau_eco = list(self.last_peak_torques)
+        cost_fast_tl = energy_fast_joules / 3.6e6 * tariff
+        cost_eco_tl = energy_eco_joules / 3.6e6 * tariff
 
         math_log += f">> Adım 1: Hedef Uzay Vektörü (P_hedef)\n   P = [ {x_cm:.1f} cm, {y_cm:.1f} cm, {z_cm:.1f} cm ]^T\n\n"
         math_log += f">> Adım 2: Jacobian Ters Matris & Açı Sınırları (Constrained IK)\n"
@@ -422,15 +461,36 @@ class KinematicsEngine:
             math_log += f"  - Uç Yükü (Payload) : 0.0 kg (Yüksüz / Nominal motor hızı ve torku)\n"
         else:
             math_log += f"  - Uç Yükü (Payload) : {payload:.2f} kg (Kapasite: {rated_capacity:.1f} kg | Yük Oranı: %{load_ratio*100:.0f})\n"
-        
-        math_log += f"  - Motor Verimi      : %{eff*100:.0f} | Birim Elektrik: {tariff:.2f} TL/kWh | Bekleme: {standby_total_w:.0f}W\n\n"
+        math_log += f"  - Robot Kütlesi     : {self.telemetry.robot_mass_kg:.1f} kg ({self.telemetry.mass_source})\n"
+        math_log += f"  - Motor Verimi      : %{eff*100:.0f} | Birim Elektrik: {tariff:.2f} TL/kWh | Bekleme: {standby_total_w:.0f}W\n"
+        if self.telemetry.dynamics_ok:
+            math_log += "  - Enerji: ters dinamikten eklem torkları (yerçekimi + ivme), mekanik güç/verim + bakır kaybı + bekleme\n\n"
+        else:
+            math_log += "  - [!] Bu modelde ters dinamik hesaplanamadı (URDF atalet değerleri); enerji tahmini yok\n\n"
         math_log += " [ Strateji 1: Hızlı Rota (Trapezoidal) ]\n"
         math_log += f"  • Tahmini Süre : {self.time_fast:.2f} sn\n"
-        math_log += f"  • Tahmini Maliyet : {cost_fast_tl:.4f} TL\n\n"
+        math_log += f"  • Tahmini Enerji : {energy_fast_joules / 3600:.3f} Wh | Tepe Güç: {self.peak_power_fast:.0f} W\n"
+        math_log += f"  • Tahmini Maliyet : {cost_fast_tl:.5f} TL\n\n"
         math_log += " [ Strateji 2: Ekonomik Rota (S-Eğrisi) ]\n"
         math_log += f"  • Tahmini Süre : {self.time_eco:.2f} sn\n"
-        math_log += f"  • Tahmini Maliyet : {cost_eco_tl:.4f} TL\n"
-        math_log += f"  >> TASARRUF FARKI : Ekonomik rota ile %{saving_pct:.1f} daha az elektrik faturası!\n\n"
+        math_log += f"  • Tahmini Enerji : {energy_eco_joules / 3600:.3f} Wh | Tepe Güç: {self.peak_power_eco:.0f} W\n"
+        math_log += f"  • Tahmini Maliyet : {cost_eco_tl:.5f} TL\n"
+        if cost_eco_tl < cost_fast_tl:
+            math_log += f"  >> TASARRUF FARKI : Ekonomik rota ile %{(1 - cost_eco_tl / max(1e-12, cost_fast_tl)) * 100:.1f} daha az elektrik.\n\n"
+        else:
+            math_log += f"  >> TASARRUF FARKI : Hızlı rota %{(1 - cost_fast_tl / max(1e-12, cost_eco_tl)) * 100:.1f} daha ucuz (kısa sürede bekleme ve tutma kayıpları daha az birikir).\n\n"
+
+        # Girilen motor verisiyle (toplam güç / eksen etiketi) tork sınırı aşılıyor mu
+        torque_warnings = []
+        for k, spec in enumerate(self.telemetry.motor_specs):
+            if not spec["real_limit"] or k >= len(peak_tau_fast): continue
+            unit = "N" if spec["linear"] else "N·m"
+            if peak_tau_eco[k] > spec["limit"]:
+                torque_warnings.append(f"  [!] J{k + 1}: iki rotada da tork yetmiyor (Eko {peak_tau_eco[k]:.2f} > sınır {spec['limit']:.2f} {unit})")
+            elif peak_tau_fast[k] > spec["limit"]:
+                torque_warnings.append(f"  [!] J{k + 1}: Hızlı rotada tork yetmiyor ({peak_tau_fast[k]:.2f} > {spec['limit']:.2f} {unit}), Eko yeterli")
+        if torque_warnings:
+            math_log += ">> MOTOR TORK KONTROLÜ\n" + "\n".join(torque_warnings) + "\n\n"
 
         math_log += ">> Adım 4: SANAL GÜVENLİK & ÇARPIŞMA ANALİZİ\n"
         has_collision_risk = False
